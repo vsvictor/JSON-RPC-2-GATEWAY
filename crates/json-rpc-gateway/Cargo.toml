@@ -1,0 +1,56 @@
+[package]
+name = "json-rpc-gateway"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["websocket"]
+srt = ["json-rpc-2-runtime/srt", "json-rpc-2-websockets/srt", "json-rpc-balancer/srt"]
+websocket = []
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+dashmap = "6"
+dotenvy = "0.15.7"
+futures-util = { version = "0.3", features = ["sink"] }
+axum = { version = "0.8", features = ["ws"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+json-rpc-2-core.workspace = true
+json-rpc-2-iot.workspace = true
+json-rpc-2-quic.workspace = true
+json-rpc-2-tcp.workspace = true
+json-rpc-2-websockets.workspace = true
+json-rpc-2-runtime.workspace = true
+json-rpc-2-server.workspace = true
+json-rpc-2-transport.workspace = true
+json-rpc-2-datagram.workspace = true
+json-rpc-balancer = { path = "../json-rpc-balancer" }
+gateway-sessions = { path = "../gateway-sessions" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+socket2 = "0.6"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "stream"] }
+tower = { version = "0.5", features = ["util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+gateway-protocol = { path = "../gateway-protocol" }
+json-rpc-2-client = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
+rcgen = "0.13"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

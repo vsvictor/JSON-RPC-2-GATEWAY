@@ -1,0 +1,30 @@
+[package]
+name = "json-rpc-balancer"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+srt = ["json-rpc-2-datagram/srt", "json-rpc-2-websockets/srt", "json-rpc-2-runtime/srt"]
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+gateway-protocol = { path = "../gateway-protocol" }
+gateway-sessions = { path = "../gateway-sessions" }
+json-rpc-2-transport.workspace = true
+json-rpc-2-tcp.workspace = true
+json-rpc-2-quic.workspace = true
+json-rpc-2-iot.workspace = true
+json-rpc-2-datagram.workspace = true
+json-rpc-2-websockets.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["fs", "io-util", "net", "sync", "time", "rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+rcgen = "0.13"
+rustls-pki-types = "1"
+json-rpc-2-runtime.workspace = true
+json-rpc-2-server.workspace = true

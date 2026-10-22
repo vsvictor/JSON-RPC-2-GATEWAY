@@ -1,0 +1,15 @@
+[package]
+name = "gateway-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Internal opaque gateway/backend protocol and backend adapter"
+
+[dependencies]
+bytes = "1"
+json-rpc-2-core.workspace = true
+json-rpc-2-transport.workspace = true
+tracing = "0.1"
+
+[dev-dependencies]
+json-rpc-2-tcp.workspace = true
+tokio = { version = "1", features = ["io-util", "macros", "rt", "sync"] }
