@@ -61,7 +61,7 @@ impl SessionIdentity {
     }
 
     pub fn generate(push_to: impl Into<String>) -> Result<Self, SessionError> {
-        Self::new(uuid::Uuid::new_v4().simple().to_string(), push_to)
+        Self::new(uuid::Uuid::new_v4().to_string(), push_to)
     }
 
     pub fn validate(&self) -> Result<(), SessionError> {
@@ -176,7 +176,7 @@ impl SessionRegistry {
                     >= self.policy.session_lease
             {
                 state.active.remove(&identity.id);
-                state.retired.insert(identity.id, now);
+                self.retire(&mut state, identity.id, now);
                 return Err(SessionError::Retired);
             }
             existing.last_activity = now;
@@ -210,7 +210,7 @@ impl SessionRegistry {
             && now.saturating_duration_since(session.last_activity) >= self.policy.session_lease
         {
             state.active.remove(&identity.id);
-            state.retired.insert(identity.id.clone(), now);
+            self.retire(&mut state, identity.id.clone(), now);
             return false;
         }
         session.last_activity = now;
@@ -233,7 +233,7 @@ impl SessionRegistry {
             && now.saturating_duration_since(session.last_activity) >= self.policy.session_lease
         {
             state.active.remove(&identity.id);
-            state.retired.insert(identity.id.clone(), now);
+            self.retire(&mut state, identity.id.clone(), now);
             return None;
         }
         session.last_activity = now;
@@ -248,7 +248,7 @@ impl SessionRegistry {
     pub fn close(&self, id: &str, now: Instant) -> Option<SessionIdentity> {
         let mut state = self.state.lock().expect("session registry poisoned");
         let session = state.active.remove(id)?;
-        state.retired.insert(id.to_owned(), now);
+        self.retire(&mut state, id.to_owned(), now);
         Some(session.identity)
     }
 
@@ -258,6 +258,7 @@ impl SessionRegistry {
         identity: &SessionIdentity,
         now: Instant,
     ) -> Option<SessionIdentity> {
+        identity.validate().ok()?;
         let mut state = self.state.lock().expect("session registry poisoned");
         if state
             .active
@@ -267,7 +268,7 @@ impl SessionRegistry {
             return None;
         }
         let session = state.active.remove(&identity.id)?;
-        state.retired.insert(identity.id.clone(), now);
+        self.retire(&mut state, identity.id.clone(), now);
         Some(session.identity)
     }
 
@@ -288,7 +289,7 @@ impl SessionRegistry {
         for id in expired_ids {
             if let Some(session) = state.active.remove(&id) {
                 expired.push(session.identity);
-                state.retired.insert(id, now);
+                self.retire(&mut state, id, now);
             }
         }
         self.prune_retired(&mut state, now);
@@ -306,6 +307,20 @@ impl SessionRegistry {
         state
             .retired
             .retain(|_, closed_at| now.saturating_duration_since(*closed_at) < tombstone_lifetime);
+    }
+
+    fn retire(&self, state: &mut RegistryState, id: String, now: Instant) {
+        if !state.retired.contains_key(&id)
+            && state.retired.len() >= self.max_sessions
+            && let Some(oldest) = state
+                .retired
+                .iter()
+                .min_by_key(|(_, closed_at)| **closed_at)
+                .map(|(id, _)| id.clone())
+        {
+            state.retired.remove(&oldest);
+        }
+        state.retired.insert(id, now);
     }
 
     pub fn len(&self) -> usize {
@@ -390,9 +405,33 @@ mod tests {
         let session = identity();
         registry.open(session.clone(), now).unwrap();
 
-        assert_eq!(registry.close(&session.id, now), Some(session.clone()));
+        let wrong_route =
+            SessionIdentity::new(session.id.clone(), "json-rpc-2/replies/other").unwrap();
+        assert!(registry.close_identity(&wrong_route, now).is_none());
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.close_identity(&session, now),
+            Some(session.clone())
+        );
         assert!(!registry.heartbeat(&session, now));
         assert_eq!(registry.open(session, now), Err(SessionError::Retired));
+    }
+
+    #[test]
+    fn registry_bounds_retired_identity_tombstones() {
+        let registry = SessionRegistry::new(BrokerSessionPolicy::default(), 1).unwrap();
+        let now = Instant::now();
+        let first = identity();
+        let second = SessionIdentity::generate("json-rpc-2/replies/second").unwrap();
+        registry.open(first.clone(), now).unwrap();
+        registry.close(&first.id, now).unwrap();
+        registry.open(second.clone(), now).unwrap();
+        registry
+            .close(&second.id, now + Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(registry.open(second, now), Err(SessionError::Retired));
+        assert!(registry.open(first, now).is_ok());
     }
 
     #[test]
