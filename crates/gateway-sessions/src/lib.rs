@@ -163,12 +163,21 @@ impl SessionRegistry {
     pub fn open(&self, identity: SessionIdentity, now: Instant) -> Result<(), SessionError> {
         identity.validate()?;
         let mut state = self.state.lock().expect("session registry poisoned");
+        self.prune_retired(&mut state, now);
         if state.retired.contains_key(&identity.id) {
             return Err(SessionError::Retired);
         }
         if let Some(existing) = state.active.get_mut(&identity.id) {
             if existing.identity != identity {
                 return Err(SessionError::IdentityConflict);
+            }
+            if existing.in_flight == 0
+                && now.saturating_duration_since(existing.last_activity)
+                    >= self.policy.session_lease
+            {
+                state.active.remove(&identity.id);
+                state.retired.insert(identity.id, now);
+                return Err(SessionError::Retired);
             }
             existing.last_activity = now;
             return Ok(());
@@ -190,10 +199,18 @@ impl SessionRegistry {
     /// Refresh an active session only when its complete routing identity matches.
     pub fn heartbeat(&self, identity: &SessionIdentity, now: Instant) -> bool {
         let mut state = self.state.lock().expect("session registry poisoned");
+        self.prune_retired(&mut state, now);
         let Some(session) = state.active.get_mut(&identity.id) else {
             return false;
         };
         if session.identity != *identity {
+            return false;
+        }
+        if session.in_flight == 0
+            && now.saturating_duration_since(session.last_activity) >= self.policy.session_lease
+        {
+            state.active.remove(&identity.id);
+            state.retired.insert(identity.id.clone(), now);
             return false;
         }
         session.last_activity = now;
@@ -207,8 +224,16 @@ impl SessionRegistry {
         now: Instant,
     ) -> Option<SessionRequest> {
         let mut state = self.state.lock().expect("session registry poisoned");
+        self.prune_retired(&mut state, now);
         let session = state.active.get_mut(&identity.id)?;
         if session.identity != *identity {
+            return None;
+        }
+        if session.in_flight == 0
+            && now.saturating_duration_since(session.last_activity) >= self.policy.session_lease
+        {
+            state.active.remove(&identity.id);
+            state.retired.insert(identity.id.clone(), now);
             return None;
         }
         session.last_activity = now;
@@ -224,6 +249,25 @@ impl SessionRegistry {
         let mut state = self.state.lock().expect("session registry poisoned");
         let session = state.active.remove(id)?;
         state.retired.insert(id.to_owned(), now);
+        Some(session.identity)
+    }
+
+    /// Close only when the supplied push route matches the registered identity.
+    pub fn close_identity(
+        &self,
+        identity: &SessionIdentity,
+        now: Instant,
+    ) -> Option<SessionIdentity> {
+        let mut state = self.state.lock().expect("session registry poisoned");
+        if state
+            .active
+            .get(&identity.id)
+            .is_none_or(|session| session.identity != *identity)
+        {
+            return None;
+        }
+        let session = state.active.remove(&identity.id)?;
+        state.retired.insert(identity.id.clone(), now);
         Some(session.identity)
     }
 
@@ -247,13 +291,21 @@ impl SessionRegistry {
                 state.retired.insert(id, now);
             }
         }
-        let tombstone_lifetime = lease
+        self.prune_retired(&mut state, now);
+        expired
+    }
+
+    fn prune_retired(&self, state: &mut RegistryState, now: Instant) {
+        let Some(tombstone_lifetime) = self
+            .policy
+            .session_lease
             .checked_add(self.policy.heartbeat_interval)
-            .expect("validated broker session policy");
+        else {
+            return;
+        };
         state
             .retired
             .retain(|_, closed_at| now.saturating_duration_since(*closed_at) < tombstone_lifetime);
-        expired
     }
 
     pub fn len(&self) -> usize {
