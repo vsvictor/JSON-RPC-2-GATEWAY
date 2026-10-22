@@ -34,17 +34,12 @@ pub(crate) async fn connect(
         .await?
         .next()
         .context("backend host resolved to no addresses")?;
-    fn broker_sessions(config: &BackendConfig) -> json_rpc_2_iot::BrokerSessionConfig {
-        let policy = gateway_sessions::BrokerSessionPolicy {
+    fn broker_sessions(config: &BackendConfig) -> gateway_sessions::BrokerSessionPolicy {
+        gateway_sessions::BrokerSessionPolicy {
             heartbeat_interval: std::time::Duration::from_millis(
                 config.options.broker_heartbeat_interval_ms,
             ),
             session_lease: std::time::Duration::from_millis(config.options.broker_session_lease_ms),
-        };
-        policy.validate().expect("validated backend broker policy");
-        json_rpc_2_iot::BrokerSessionConfig {
-            heartbeat_interval: policy.heartbeat_interval,
-            session_lease: policy.session_lease,
         }
     }
     macro_rules! simple {

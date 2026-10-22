@@ -17,9 +17,13 @@ json-rpc-2-transport = { git = "https://github.com/vsvictor/JSON-RPC-2.git", bra
 json-rpc-2-tcp = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
 json-rpc-2-quic = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
 json-rpc-2-iot = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
+gateway-sessions = { path = "crates/gateway-sessions" }
 json-rpc-2-datagram = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start", default-features = false, features = ["udp", "rtp", "rudp", "udplite", "dccp", "sctp"] }
 json-rpc-2-websockets = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start", default-features = false, features = ["websocket", "tls", "tcp", "udp", "rtp", "rudp", "udplite", "dccp", "sctp", "quic", "http1", "http3", "mqtt", "coap", "amqp"] }
 
 [patch.crates-io]
 h3 = { git = "https://github.com/hyperium/h3", package = "h3" }
 h3-quinn = { git = "https://github.com/hyperium/h3", package = "h3-quinn" }
+
+[patch."https://github.com/vsvictor/JSON-RPC-2-GATEWAY.git"]
+gateway-sessions = { path = "crates/gateway-sessions" }

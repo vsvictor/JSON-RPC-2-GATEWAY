@@ -10,7 +10,7 @@ srt = ["json-rpc-2-datagram/srt", "json-rpc-2-websockets/srt", "json-rpc-2-runti
 anyhow = "1"
 bytes = "1"
 gateway-protocol = { path = "../gateway-protocol" }
-gateway-sessions = { path = "../gateway-sessions" }
+gateway-sessions.workspace = true
 json-rpc-2-transport.workspace = true
 json-rpc-2-tcp.workspace = true
 json-rpc-2-quic.workspace = true

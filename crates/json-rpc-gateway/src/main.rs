@@ -44,11 +44,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
-    let broker_transport_sessions =
-        broker_sessions.map(|policy| json_rpc_2_iot::BrokerSessionConfig {
-            heartbeat_interval: policy.heartbeat_interval,
-            session_lease: policy.session_lease,
-        });
     #[cfg(any(target_os = "linux", target_os = "android"))]
     server.set_udplite_config(udplite_config);
     #[cfg(feature = "srt")]
@@ -64,8 +59,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .as_deref()
                 .context("MQTT_BROKER_URL is required when MQTT transport is enabled")?;
             let mqtt = MqttConfig {
-                sessions: broker_transport_sessions
-                    .context("broker session policy was not initialized")?,
+                sessions: broker_sessions.context("broker session policy was not initialized")?,
                 broker_url: broker_url.to_owned(),
                 ..Default::default()
             };
@@ -79,8 +73,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .as_deref()
                 .context("MQTT_BROKER_URL is required when MQTT transport is enabled")?;
             let mqtt = MqttConfig {
-                sessions: broker_transport_sessions
-                    .context("broker session policy was not initialized")?,
+                sessions: broker_sessions.context("broker session policy was not initialized")?,
                 broker_url: broker_url.to_owned(),
                 request_topic: "json-rpc-2/ws/requests".to_owned(),
                 ..Default::default()
@@ -94,8 +87,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .as_deref()
                 .context("AMQP_BROKER_URL is required when AMQP transport is enabled")?;
             let amqp = AmqpConfig {
-                sessions: broker_transport_sessions
-                    .context("broker session policy was not initialized")?,
+                sessions: broker_sessions.context("broker session policy was not initialized")?,
                 broker_url: broker_url.to_owned(),
                 ..Default::default()
             };
@@ -109,8 +101,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .as_deref()
                 .context("AMQP_BROKER_URL is required when AMQP transport is enabled")?;
             let amqp = AmqpConfig {
-                sessions: broker_transport_sessions
-                    .context("broker session policy was not initialized")?,
+                sessions: broker_sessions.context("broker session policy was not initialized")?,
                 broker_url: broker_url.to_owned(),
                 request_queue: "json-rpc-2.ws.requests".to_owned(),
                 ..Default::default()
