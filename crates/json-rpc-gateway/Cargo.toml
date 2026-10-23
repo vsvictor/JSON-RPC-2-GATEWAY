@@ -21,6 +21,7 @@ http = "1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 json-rpc-2-core.workspace = true
+gateway-protocol.workspace = true
 json-rpc-2-iot.workspace = true
 gateway-iot.workspace = true
 json-rpc-2-quic.workspace = true
@@ -51,7 +52,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-gateway-protocol = { path = "../gateway-protocol" }
 json-rpc-2-client = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
 rcgen = "0.13"
 

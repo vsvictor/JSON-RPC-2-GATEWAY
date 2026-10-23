@@ -12,6 +12,7 @@ resolver = "2"
 
 [workspace.dependencies]
 json-rpc-2-runtime = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start", default-features = false, features = ["tcp", "tls", "udp", "rtp", "rudp", "udplite", "dccp", "sctp", "quic", "http1", "http3", "mqtt", "coap", "amqp", "websocket", "websocket_tls"] }
+gateway-protocol = { path = "crates/gateway-protocol" }
 json-rpc-2-core = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
 json-rpc-2-server = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
 json-rpc-2-transport = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
