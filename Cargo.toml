@@ -26,18 +26,3 @@ json-rpc-2-websockets = { git = "https://github.com/vsvictor/JSON-RPC-2.git", br
 [patch.crates-io]
 h3 = { git = "https://github.com/hyperium/h3", package = "h3" }
 h3-quinn = { git = "https://github.com/hyperium/h3", package = "h3-quinn" }
-
-[patch."https://github.com/vsvictor/JSON-RPC-2-GATEWAY.git"]
-gateway-sessions = { path = "crates/gateway-sessions" }
-gateway-iot = { path = "crates/gateway-iot" }
-
-[patch."https://github.com/vsvictor/JSON-RPC-2.git"]
-json-rpc-2-core = { path = ".upstream-work/JSON-RPC-2/json-rpc-2-core" }
-json-rpc-2-datagram = { path = ".upstream-work/JSON-RPC-2/json-rpc-2-datagram" }
-json-rpc-2-iot = { path = ".upstream-work/JSON-RPC-2/json-rpc-2-iot" }
-json-rpc-2-quic = { path = ".upstream-work/JSON-RPC-2/json-rpc-2-quic" }
-json-rpc-2-runtime = { path = ".upstream-work/JSON-RPC-2/json-rpc-2-runtime" }
-json-rpc-2-server = { path = ".upstream-work/JSON-RPC-2/json-rpc-2-server" }
-json-rpc-2-tcp = { path = ".upstream-work/JSON-RPC-2/json-rpc-2-tcp" }
-json-rpc-2-transport = { path = ".upstream-work/JSON-RPC-2/json-rpc-2-transport" }
-json-rpc-2-websockets = { path = ".upstream-work/JSON-RPC-2/json-rpc-2-websockets" }
