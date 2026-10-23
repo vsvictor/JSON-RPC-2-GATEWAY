@@ -32,7 +32,7 @@ impl SessionRegistry {
 
     pub fn register_session(&self, context: &TransportContext) {
         let _metadata = self.metadata.lock().unwrap();
-        tracing::debug!(connection_id = %context.connection_id, transport = %context.transport,
+        tracing::info!(connection_id = %context.connection_id, transport = %context.transport,
             supports_push = context.push_sender.is_some(), "gateway session opened");
         self.sessions.insert(
             context.connection_id.clone(),
@@ -158,6 +158,14 @@ impl SessionRegistry {
         let Some(sender) = session.push_sender else {
             return Err("PushNotSupportedForTransport".to_owned());
         };
+        tracing::debug!(
+            connection_id,
+            transport = %session.transport,
+            direction = "gateway_to_client",
+            payload_bytes = payload.len(),
+            payload = %String::from_utf8_lossy(&payload),
+            "sending gateway push"
+        );
         if sender.send(payload).is_err() {
             self.remove_session(connection_id);
             return Err("ClientDisconnected".to_owned());
@@ -168,7 +176,7 @@ impl SessionRegistry {
     pub fn remove_session(&self, connection_id: &str) {
         let _metadata = self.metadata.lock().unwrap();
         if self.sessions.remove(connection_id).is_some() {
-            tracing::debug!(connection_id, "gateway session closed");
+            tracing::info!(connection_id, "gateway session closed");
         }
         let stale_clients = self
             .clients

@@ -12,6 +12,7 @@ use gateway::Gateway;
 use ingress::GatewayIngress;
 use json_rpc_2_runtime::TransportKind;
 use json_rpc_balancer::BackendPool;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -29,10 +30,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_env_filter(filter)
         .try_init()?;
 
+    let metrics_address = SocketAddr::new(config.metrics_bind, config.metrics_port);
+    PrometheusBuilder::new()
+        .with_http_listener(metrics_address)
+        .install()?;
+    tracing::info!(%metrics_address, "Prometheus metrics listening");
+
     let backends = config.load_backends()?;
     let pool = BackendPool::new(backends)?;
     pool.warm_up().await?;
-    let gateway = Gateway::new(pool);
+    let gateway = Gateway::new(pool, config.dispatcher_limits)?;
     let control_address = SocketAddr::new(config.bind, config.control_port);
     let control_listener = TcpListener::bind(control_address)
         .await

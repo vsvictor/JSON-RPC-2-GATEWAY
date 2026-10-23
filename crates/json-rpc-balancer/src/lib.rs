@@ -44,6 +44,8 @@ pub struct BackendOptions {
     pub ws_amqp_request_queue: Option<String>,
     pub operation_timeout_ms: u64,
     pub health_check_interval_ms: u64,
+    pub circuit_breaker_failure_threshold: usize,
+    pub circuit_breaker_reset_timeout_ms: u64,
     pub broker_heartbeat_interval_ms: u64,
     pub broker_session_lease_ms: u64,
 }
@@ -62,6 +64,8 @@ impl Default for BackendOptions {
             ws_amqp_request_queue: None,
             operation_timeout_ms: 30_000,
             health_check_interval_ms: 30_000,
+            circuit_breaker_failure_threshold: 5,
+            circuit_breaker_reset_timeout_ms: 10_000,
             broker_heartbeat_interval_ms: 10_000,
             broker_session_lease_ms: 45_000,
         }
@@ -103,6 +107,221 @@ struct TransportPool {
     port: u16,
     slots: Vec<Mutex<ConnectionSlot>>,
     cursor: RoundRobin,
+    circuit_breaker: CircuitBreaker,
+}
+
+struct CircuitBreaker {
+    failure_threshold: usize,
+    reset_timeout: Duration,
+    backend_id: String,
+    transport: String,
+    endpoint: String,
+    state: std::sync::Mutex<CircuitState>,
+}
+
+enum CircuitState {
+    Closed { consecutive_failures: usize },
+    Open { opened_at: Instant },
+    HalfOpen { probe_in_flight: bool },
+}
+
+struct CircuitPermit<'a> {
+    breaker: &'a CircuitBreaker,
+    half_open: bool,
+    completed: bool,
+}
+
+impl CircuitBreaker {
+    fn new(backend_id: &str, transport: &str, options: &BackendOptions) -> Self {
+        let breaker = Self {
+            failure_threshold: options.circuit_breaker_failure_threshold,
+            reset_timeout: Duration::from_millis(options.circuit_breaker_reset_timeout_ms),
+            backend_id: backend_id.to_owned(),
+            transport: transport.to_owned(),
+            endpoint: format!("{backend_id}/{transport}"),
+            state: std::sync::Mutex::new(CircuitState::Closed {
+                consecutive_failures: 0,
+            }),
+        };
+        breaker.set_open_metric(false);
+        breaker
+    }
+
+    fn set_open_metric(&self, open: bool) {
+        metrics::gauge!(
+            "gateway_backend_circuit_open",
+            "backend" => self.backend_id.clone(),
+            "transport" => self.transport.clone()
+        )
+        .set(if open { 1.0 } else { 0.0 });
+    }
+
+    fn record_probe(&self, result: &'static str) {
+        metrics::counter!(
+            "gateway_backend_circuit_probe_total",
+            "backend" => self.backend_id.clone(),
+            "transport" => self.transport.clone(),
+            "result" => result
+        )
+        .increment(1);
+    }
+
+    fn acquire(&self) -> anyhow::Result<CircuitPermit<'_>> {
+        let mut state = self.state.lock().unwrap();
+        let half_open = match &mut *state {
+            CircuitState::Closed { .. } => false,
+            CircuitState::Open { opened_at } if opened_at.elapsed() >= self.reset_timeout => {
+                *state = CircuitState::HalfOpen {
+                    probe_in_flight: true,
+                };
+                true
+            }
+            CircuitState::Open { .. } => {
+                anyhow::bail!("backend endpoint {} circuit breaker is open", self.endpoint)
+            }
+            CircuitState::HalfOpen {
+                probe_in_flight: false,
+            } => {
+                *state = CircuitState::HalfOpen {
+                    probe_in_flight: true,
+                };
+                true
+            }
+            CircuitState::HalfOpen {
+                probe_in_flight: true,
+            } => anyhow::bail!(
+                "backend endpoint {} circuit breaker half-open probe is in progress",
+                self.endpoint
+            ),
+        };
+        Ok(CircuitPermit {
+            breaker: self,
+            half_open,
+            completed: false,
+        })
+    }
+
+    fn is_closed(&self) -> bool {
+        matches!(&*self.state.lock().unwrap(), CircuitState::Closed { .. })
+    }
+
+    fn record_maintenance_result(&self, succeeded: bool) {
+        let mut state = self.state.lock().unwrap();
+        let CircuitState::Closed {
+            consecutive_failures,
+        } = &mut *state
+        else {
+            return;
+        };
+
+        if succeeded {
+            *consecutive_failures = 0;
+        } else {
+            *consecutive_failures += 1;
+            if *consecutive_failures >= self.failure_threshold {
+                *state = CircuitState::Open {
+                    opened_at: Instant::now(),
+                };
+                self.set_open_metric(true);
+                tracing::warn!(
+                    endpoint = %self.endpoint,
+                    failures = self.failure_threshold,
+                    reset_timeout_ms = self.reset_timeout.as_millis(),
+                    "backend circuit breaker opened after maintenance health check failures"
+                );
+            }
+        }
+    }
+}
+
+impl CircuitPermit<'_> {
+    fn is_half_open(&self) -> bool {
+        self.half_open
+    }
+
+    fn complete(mut self, succeeded: bool) {
+        self.record(succeeded);
+        self.completed = true;
+    }
+
+    fn record(&self, succeeded: bool) {
+        let mut state = self.breaker.state.lock().unwrap();
+        match (&mut *state, self.half_open, succeeded) {
+            (
+                CircuitState::Closed {
+                    consecutive_failures,
+                },
+                false,
+                true,
+            ) => {
+                *consecutive_failures = 0;
+            }
+            (
+                CircuitState::Closed {
+                    consecutive_failures,
+                },
+                false,
+                false,
+            ) => {
+                *consecutive_failures += 1;
+                if *consecutive_failures >= self.breaker.failure_threshold {
+                    *state = CircuitState::Open {
+                        opened_at: Instant::now(),
+                    };
+                    self.breaker.set_open_metric(true);
+                    tracing::warn!(
+                        endpoint = %self.breaker.endpoint,
+                        failures = self.breaker.failure_threshold,
+                        reset_timeout_ms = self.breaker.reset_timeout.as_millis(),
+                        "backend circuit breaker opened"
+                    );
+                }
+            }
+            (CircuitState::HalfOpen { .. }, true, true) => {
+                *state = CircuitState::Closed {
+                    consecutive_failures: 0,
+                };
+                self.breaker.set_open_metric(false);
+                self.breaker.record_probe("success");
+                tracing::info!(
+                    endpoint = %self.breaker.endpoint,
+                    "backend circuit breaker closed after successful probe"
+                );
+            }
+            (CircuitState::HalfOpen { .. }, true, false) => {
+                *state = CircuitState::Open {
+                    opened_at: Instant::now(),
+                };
+                self.breaker.set_open_metric(true);
+                self.breaker.record_probe("failure");
+                tracing::warn!(
+                    endpoint = %self.breaker.endpoint,
+                    reset_timeout_ms = self.breaker.reset_timeout.as_millis(),
+                    "backend circuit breaker reopened after failed probe"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for CircuitPermit<'_> {
+    fn drop(&mut self) {
+        if !self.completed && self.half_open {
+            let mut state = self.breaker.state.lock().unwrap();
+            if matches!(
+                &*state,
+                CircuitState::HalfOpen {
+                    probe_in_flight: true
+                }
+            ) {
+                self.breaker.record_probe("cancelled");
+                *state = CircuitState::HalfOpen {
+                    probe_in_flight: false,
+                };
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -175,6 +394,12 @@ impl BackendPool {
                 "backend {} timeouts must be greater than zero",
                 config.id
             );
+            anyhow::ensure!(
+                config.options.circuit_breaker_failure_threshold > 0
+                    && config.options.circuit_breaker_reset_timeout_ms > 0,
+                "backend {} circuit breaker settings must be greater than zero",
+                config.id
+            );
             let sessions = gateway_sessions::BrokerSessionPolicy {
                 heartbeat_interval: Duration::from_millis(
                     config.options.broker_heartbeat_interval_ms,
@@ -219,6 +444,7 @@ impl BackendPool {
                             .map(|_| Mutex::new(ConnectionSlot::default()))
                             .collect(),
                         cursor: RoundRobin::default(),
+                        circuit_breaker: CircuitBreaker::new(&config.id, kind, &config.options),
                     },
                 );
             }
@@ -286,65 +512,154 @@ impl BackendPool {
         source_transport: &str,
         connection_id: &str,
     ) -> anyhow::Result<Option<Bytes>> {
+        self.forward_traced(payload, source_transport, connection_id, 0)
+            .await
+    }
+
+    pub async fn forward_traced(
+        &self,
+        payload: &Bytes,
+        source_transport: &str,
+        connection_id: &str,
+        trace_id: u64,
+    ) -> anyhow::Result<Option<Bytes>> {
         let request = encode_request(payload, connection_id, source_transport)?;
-        let index = if matches!(source_transport, "quic" | "ws-quic") {
-            *self
-                .affinity
-                .lock()
-                .unwrap()
-                .get(connection_id)
-                .context("QUIC session is not registered or has already closed")?
+        let affinity_index = if matches!(source_transport, "quic" | "ws-quic") {
+            Some(
+                *self
+                    .affinity
+                    .lock()
+                    .unwrap()
+                    .get(connection_id)
+                    .context("QUIC session is not registered or has already closed")?,
+            )
         } else {
-            self.strategy.select(self.backends.len())
+            None
         };
-        let backend = self
-            .backends
-            .get(index)
-            .context("load balancing strategy selected an invalid backend index")?;
-        let (kind, pool) = Self::route(backend, source_transport);
-        let mut slot = pool.slots[pool.cursor.select(pool.slots.len())]
-            .lock()
-            .await;
-        if slot.connection.is_none()
-            || slot
-                .checked_at
-                .is_none_or(|at| at.elapsed() >= health_interval(backend))
-        {
-            self.check_slot(backend, kind, pool.port, &mut slot).await?;
-        }
-        // Taking ownership invalidates the slot on error, timeout, or future cancellation.
-        // Never replay an exchange: the backend may already have executed it.
-        let connection = slot
-            .connection
-            .take()
-            .context("backend slot has no connection after validation")?;
-        tracing::debug!(backend = %backend.config.id, transport = kind, source_transport, connection_id, "forwarding opaque gateway message");
-        let result = timeout(
-            operation_timeout(backend),
-            connection.transport.send_message(request, true),
-        )
-        .await;
-        let response = match result {
-            Ok(Ok(Some(frame))) => decode_response(frame)?,
-            Ok(Ok(None)) => anyhow::bail!(
-                "backend {} returned no gateway acknowledgement",
-                backend.config.id
-            ),
-            Ok(Err(error)) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "backend {} transport {kind} exchange failed",
-                        backend.config.id
-                    )
-                });
+        let (backend, kind, pool, permit) = if let Some(index) = affinity_index {
+            let backend = self
+                .backends
+                .get(index)
+                .context("QUIC affinity selected an invalid backend index")?;
+            let (kind, pool) = Self::route(backend, source_transport);
+            let permit = pool.circuit_breaker.acquire().inspect_err(|error| {
+                let reason = if error.to_string().contains("half-open") {
+                    "half_open_probe_in_progress"
+                } else {
+                    "circuit_open"
+                };
+                metrics::counter!(
+                    "gateway_backend_requests_rejected_total",
+                    "backend" => backend.config.id.clone(),
+                    "transport" => kind.to_owned(),
+                    "reason" => reason
+                )
+                .increment(1);
+            })?;
+            (backend, kind, pool, permit)
+        } else {
+            let first = self.strategy.select(self.backends.len());
+            anyhow::ensure!(
+                first < self.backends.len(),
+                "load balancing strategy selected an invalid backend index"
+            );
+            let mut selected = None;
+            let mut last_error = None;
+            for offset in 0..self.backends.len() {
+                let index = (first + offset) % self.backends.len();
+                let backend = &self.backends[index];
+                let (kind, pool) = Self::route(backend, source_transport);
+                match pool.circuit_breaker.acquire() {
+                    Ok(permit) => {
+                        selected = Some((backend, kind, pool, permit));
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
             }
-            Err(_) => anyhow::bail!(
-                "backend {} transport {kind} exchange timed out; request was not replayed",
-                backend.config.id
-            ),
+            selected.ok_or_else(|| {
+                metrics::counter!(
+                    "gateway_backend_requests_rejected_total",
+                    "backend" => "multiple",
+                    "transport" => source_transport.to_owned(),
+                    "reason" => "all_endpoints_unavailable"
+                )
+                .increment(1);
+                last_error.unwrap_or_else(|| anyhow::anyhow!("no backend endpoint is available"))
+            })?
         };
-        slot.connection = Some(connection);
-        Ok(response)
+        let result = async {
+            let mut slot = pool.slots[pool.cursor.select(pool.slots.len())]
+                .lock()
+                .await;
+            if slot.connection.is_none()
+                || permit.is_half_open()
+                || slot
+                    .checked_at
+                    .is_none_or(|at| at.elapsed() >= health_interval(backend))
+            {
+                self.check_slot(backend, kind, pool.port, &mut slot).await?;
+            }
+            // Taking ownership invalidates the slot on error, timeout, or future cancellation.
+            // Never replay an exchange: the backend may already have executed it.
+            let connection = slot
+                .connection
+                .take()
+                .context("backend slot has no connection after validation")?;
+            tracing::debug!(
+                trace_id,
+                backend = %backend.config.id,
+                endpoint = %format!("{}:{}", backend.config.host, pool.port),
+                transport = kind,
+                source_transport,
+                connection_id,
+                direction = "gateway_to_backend",
+                payload_bytes = payload.len(),
+                payload = %String::from_utf8_lossy(payload),
+                "sending gateway request to backend"
+            );
+            let exchange = timeout(
+                operation_timeout(backend),
+                connection.transport.send_message(request, true),
+            )
+            .await;
+            let response = match exchange {
+                Ok(Ok(Some(frame))) => decode_response(frame)?,
+                Ok(Ok(None)) => anyhow::bail!(
+                    "backend {} returned no gateway acknowledgement",
+                    backend.config.id
+                ),
+                Ok(Err(error)) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "backend {} transport {kind} exchange failed",
+                            backend.config.id
+                        )
+                    });
+                }
+                Err(_) => anyhow::bail!(
+                    "backend {} transport {kind} exchange timed out; request was not replayed",
+                    backend.config.id
+                ),
+            };
+            tracing::debug!(
+                trace_id,
+                backend = %backend.config.id,
+                endpoint = %format!("{}:{}", backend.config.host, pool.port),
+                transport = kind,
+                source_transport,
+                connection_id,
+                direction = "backend_to_gateway",
+                response_bytes = response.as_ref().map_or(0, Bytes::len),
+                response_payload = %response.as_ref().map(|bytes| String::from_utf8_lossy(bytes)).unwrap_or_default(),
+                "received backend response"
+            );
+            slot.connection = Some(connection);
+            Ok(response)
+        }
+        .await;
+        permit.complete(result.is_ok());
+        result
     }
 
     async fn check_slot(
@@ -413,10 +728,16 @@ impl BackendPool {
                                 .checked_at
                                 .is_none_or(|at| at.elapsed() >= health_interval(backend))
                             {
-                                if let Err(error) = pool
+                                if !transport.circuit_breaker.is_closed() {
+                                    continue;
+                                }
+                                let result = pool
                                     .check_slot(backend, kind, transport.port, &mut slot)
-                                    .await
-                                {
+                                    .await;
+                                transport
+                                    .circuit_breaker
+                                    .record_maintenance_result(result.is_ok());
+                                if let Err(error) = result {
                                     slot.checked_at = Some(Instant::now());
                                     tracing::warn!(backend = %backend.config.id, transport = kind, %error, "backend connection removed after failed validation");
                                 }
@@ -465,6 +786,104 @@ mod tests {
         assert!(BackendPool::new(vec![config(1, "unknown")]).is_err());
         assert!(BackendPool::new(vec![config(0, "http1")]).is_err());
         assert!(BackendPool::new(vec![config(1, "http1")]).is_ok());
+
+        let mut invalid_breaker = config(1, "http1");
+        invalid_breaker.options.circuit_breaker_failure_threshold = 0;
+        assert!(BackendPool::new(vec![invalid_breaker]).is_err());
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_allows_only_one_half_open_probe_and_recovers() {
+        let options = BackendOptions {
+            circuit_breaker_failure_threshold: 1,
+            circuit_breaker_reset_timeout_ms: 1,
+            ..BackendOptions::default()
+        };
+        let breaker = CircuitBreaker::new("backend", "tcp", &options);
+
+        breaker.acquire().unwrap().complete(false);
+        assert!(breaker.acquire().is_err());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let probe = breaker.acquire().unwrap();
+        assert!(probe.is_half_open());
+        assert!(breaker.acquire().is_err());
+        drop(probe);
+
+        let probe = breaker.acquire().unwrap();
+        assert!(probe.is_half_open());
+        probe.complete(true);
+        assert!(!breaker.acquire().unwrap().is_half_open());
+    }
+
+    #[tokio::test]
+    async fn round_robin_skips_open_endpoints_but_quic_affinity_does_not_fail_over() {
+        let mut running_backends = Vec::new();
+        let mut configs = Vec::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        for backend_index in 0..2 {
+            let rpc = Arc::new(RpcServer::new());
+            let backend_calls = Arc::clone(&calls);
+            rpc.register("identify", move |_| {
+                let backend_calls = Arc::clone(&backend_calls);
+                async move {
+                    backend_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(serde_json::json!({"backend": backend_index}))
+                }
+            })
+            .unwrap();
+            let running = MultiTransportServer::new(Arc::new(
+                gateway_protocol::GatewayBackendProtocol::new(rpc),
+            ))
+            .set_bind(["127.0.0.1".parse().unwrap()])
+            .set_tcp_port(0)
+            .start()
+            .await
+            .unwrap();
+            let port = running.listeners().next().unwrap().1.port();
+            let mut backend_config = config(port, "tcp");
+            backend_config.id = format!("backend-{backend_index}");
+            backend_config.options.circuit_breaker_failure_threshold = 1;
+            configs.push(backend_config);
+            running_backends.push(running);
+        }
+
+        let pool = BackendPool::new(configs).unwrap();
+        pool.warm_up().await.unwrap();
+        pool.backends[0].transports["tcp"]
+            .circuit_breaker
+            .acquire()
+            .unwrap()
+            .complete(false);
+
+        let request = Bytes::from_static(br#"{"jsonrpc":"2.0","method":"identify","id":1}"#);
+        let response = pool
+            .forward(&request, "tcp", "ordinary")
+            .await
+            .unwrap()
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["result"]["backend"], 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        pool.affinity
+            .lock()
+            .unwrap()
+            .insert("sticky-session".to_owned(), 0);
+        let affinity_error = pool
+            .forward(&request, "quic", "sticky-session")
+            .await
+            .unwrap_err();
+        assert!(affinity_error
+            .to_string()
+            .contains("circuit breaker is open"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        drop(pool);
+        for backend in running_backends {
+            backend.close().await.unwrap();
+        }
     }
 
     #[test]
@@ -945,8 +1364,15 @@ mod tests {
             }
         })
         .unwrap();
-        rpc.register("echo", |params| async move { Ok(params) })
-            .unwrap();
+        let echo_calls = calls.clone();
+        rpc.register("echo", move |params| {
+            let calls = echo_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(params)
+            }
+        })
+        .unwrap();
         let mut server =
             MultiTransportServer::new(Arc::new(gateway_protocol::GatewayBackendProtocol::new(rpc)));
         server
@@ -955,6 +1381,8 @@ mod tests {
         let running = server.start().await.unwrap();
         let mut settings = config(port, "tcp");
         settings.options.operation_timeout_ms = 50;
+        settings.options.circuit_breaker_failure_threshold = 1;
+        settings.options.circuit_breaker_reset_timeout_ms = 50;
         let pool = BackendPool::new(vec![settings]).unwrap();
         pool.warm_up().await.unwrap();
         let slow = Bytes::from_static(b"{\"jsonrpc\":\"2.0\",\"method\":\"slow\",\"id\":1}");
@@ -964,15 +1392,21 @@ mod tests {
             .await
             .connection
             .is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
         let echo = Bytes::from_static(
             b"{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"params\":[2],\"id\":2}",
         );
+        let open_error = pool.forward(&echo, "tcp", "client").await.unwrap_err();
+        assert!(open_error.to_string().contains("circuit breaker is open"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
         let response = pool.forward(&echo, "tcp", "client").await.unwrap().unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&response).unwrap()["id"],
             2
         );
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
         drop(pool);
         running.close().await.unwrap();
     }
@@ -1005,25 +1439,43 @@ mod tests {
         let mut settings = config(port, "tcp");
         settings.options.health_check_interval_ms = 10;
         settings.options.operation_timeout_ms = 100;
+        settings.options.circuit_breaker_failure_threshold = 1;
+        settings.options.circuit_breaker_reset_timeout_ms = 60_000;
         let pool = Arc::new(BackendPool::new(vec![settings]).unwrap());
         pool.warm_up().await.unwrap();
         running.close().await.unwrap();
         pool.start_maintenance();
         timeout(Duration::from_secs(2), async {
             loop {
-                if pool.backends[0].transports["tcp"].slots[0]
-                    .lock()
-                    .await
-                    .connection
-                    .is_none()
+                let slot = pool.backends[0].transports["tcp"].slots[0].lock().await;
+                if slot.connection.is_none()
+                    && slot.checked_at.is_some()
+                    && !pool.backends[0].transports["tcp"]
+                        .circuit_breaker
+                        .is_closed()
                 {
                     break;
                 }
+                drop(slot);
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
+        let checked_at = pool.backends[0].transports["tcp"].slots[0]
+            .lock()
+            .await
+            .checked_at
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            pool.backends[0].transports["tcp"].slots[0]
+                .lock()
+                .await
+                .checked_at,
+            Some(checked_at),
+            "maintenance must stop reconnecting while the endpoint circuit is open"
+        );
     }
 
     #[cfg(feature = "srt")]

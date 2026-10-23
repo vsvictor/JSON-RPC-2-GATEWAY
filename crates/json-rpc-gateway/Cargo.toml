@@ -31,6 +31,8 @@ json-rpc-2-server.workspace = true
 json-rpc-2-transport.workspace = true
 json-rpc-2-datagram.workspace = true
 json-rpc-balancer = { path = "../json-rpc-balancer" }
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+metrics = "0.24"
 gateway-sessions.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"

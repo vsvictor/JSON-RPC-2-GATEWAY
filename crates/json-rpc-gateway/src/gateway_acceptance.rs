@@ -13,7 +13,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-use super::Gateway;
+use super::{DispatcherLimits, Gateway};
 
 async fn control(stream: &mut BufReader<TcpStream>, command: Value) -> Value {
     stream
@@ -51,7 +51,7 @@ async fn http_push_is_rejected_during_request_and_registration_is_removed_after_
             ports: [("tcp".into(), port)].into_iter().collect(), pool_size: 1,
             options: Default::default(),
         }]).unwrap();
-        let gateway = Gateway::new(pool);
+        let gateway = Gateway::new(pool, DispatcherLimits::default()).unwrap();
         let frontend = MultiTransportServer::new(gateway.protocol(TransportKind::Http1))
             .set_bind(["127.0.0.1".parse().unwrap()]).set_http1_port(0).start().await.unwrap();
         let address = frontend.listeners().next().unwrap().1;
@@ -105,7 +105,7 @@ async fn quic_migration_keeps_backend_affinity_and_control_plane_push() {
         }
         let pool = BackendPool::new(configs).unwrap();
         pool.warm_up().await.unwrap();
-        let gateway = Gateway::new(pool);
+        let gateway = Gateway::new(pool, DispatcherLimits::default()).unwrap();
         let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert: rustls::pki_types::CertificateDer<'static> = identity.cert.into();
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(identity.key_pair.serialize_der().into());
@@ -207,7 +207,7 @@ async fn shared_tcp_http_ingress_preserves_backend_metadata_and_notifications() 
         options: Default::default(),
     }])
     .unwrap();
-    let gateway = Gateway::new(pool);
+    let gateway = Gateway::new(pool, DispatcherLimits::default()).unwrap();
     let mut ingress = crate::ingress::GatewayIngress::new(gateway.multiplexed_protocol());
     ingress
         .set_bind(["127.0.0.1".parse().unwrap()])

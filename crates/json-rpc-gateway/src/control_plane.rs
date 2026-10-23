@@ -104,6 +104,14 @@ async fn handle_connection(
             }
         };
         let response = serde_json::to_string(&response).map_err(std::io::Error::other)?;
+        tracing::debug!(
+            %peer,
+            request_direction = "control_plane_peer_to_gateway",
+            response_direction = "gateway_to_control_plane_peer",
+            request = %line,
+            response = %response,
+            "control-plane exchange completed"
+        );
         framed
             .send(response)
             .await

@@ -6,16 +6,21 @@ use json_rpc_2_runtime::TransportKind;
 use json_rpc_balancer::BackendConfig;
 use serde::Deserialize;
 
+use crate::gateway::DispatcherLimits;
+
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
     pub bind: IpAddr,
     pub control_port: u16,
+    pub metrics_bind: IpAddr,
+    pub metrics_port: u16,
     pub backend_config_path: PathBuf,
     pub log_level: String,
     pub transport_ports: HashMap<TransportKind, u16>,
     pub tls_cert_path: Option<PathBuf>,
     pub tls_key_path: Option<PathBuf>,
     pub iot: GatewayIotConfig,
+    pub dispatcher_limits: DispatcherLimits,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +81,17 @@ impl GatewayConfig {
 
         let gateway_port = required_u16("GATEWAY_PORT")?;
         let control_port = required_u16("CONTROL_PORT")?;
+        let metrics_bind = match env::var("METRICS_BIND") {
+            Ok(value) => value
+                .parse::<IpAddr>()
+                .context("METRICS_BIND must be a valid IP address")?,
+            Err(env::VarError::NotPresent) => IpAddr::from([127, 0, 0, 1]),
+            Err(error) => return Err(error).context("reading METRICS_BIND"),
+        };
+        let metrics_port = optional_u16("METRICS_PORT")?.unwrap_or(9090);
+        if metrics_port == 0 {
+            bail!("METRICS_PORT must be greater than zero");
+        }
         let bind = required("GATEWAY_BIND")?
             .parse::<IpAddr>()
             .context("GATEWAY_BIND must be a valid IP address")?;
@@ -104,16 +120,31 @@ impl GatewayConfig {
 
         let iot = GatewayIotConfig::from_env(transport_ports.keys().any(|kind| kind.is_broker()))
             .context("loading gateway IoT configuration")?;
+        let defaults = DispatcherLimits::default();
+        let dispatcher_limits = DispatcherLimits {
+            queue_capacity: optional_positive_usize(
+                "GATEWAY_DISPATCH_QUEUE_CAPACITY",
+                defaults.queue_capacity,
+            )?,
+            max_concurrent: optional_positive_usize(
+                "GATEWAY_DISPATCH_MAX_CONCURRENT",
+                defaults.max_concurrent,
+            )?,
+        };
+        dispatcher_limits.validate()?;
 
         Ok(Self {
             bind,
             control_port,
+            metrics_bind,
+            metrics_port,
             backend_config_path,
             log_level,
             transport_ports,
             tls_cert_path: env::var_os("TLS_CERT_PATH").map(PathBuf::from),
             tls_key_path: env::var_os("TLS_KEY_PATH").map(PathBuf::from),
             iot,
+            dispatcher_limits,
         })
     }
 
@@ -177,14 +208,32 @@ fn required_u16(name: &str) -> anyhow::Result<u16> {
 }
 
 fn optional_u16(name: &str) -> anyhow::Result<Option<u16>> {
-    env::var(name)
-        .ok()
-        .map(|value| {
-            value
-                .parse()
-                .with_context(|| format!("{name} must be a valid port number"))
-        })
-        .transpose()
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .with_context(|| format!("{name} must be a valid port number"))
+            .map(Some),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {name}")),
+    }
+}
+
+fn optional_positive_usize(name: &str, default: usize) -> anyhow::Result<usize> {
+    match env::var(name) {
+        Ok(value) => parse_positive_usize(name, &value),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error).with_context(|| format!("reading {name}")),
+    }
+}
+
+fn parse_positive_usize(name: &str, value: &str) -> anyhow::Result<usize> {
+    let parsed = value
+        .parse::<usize>()
+        .with_context(|| format!("{name} must be a positive integer"))?;
+    if parsed == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -193,7 +242,7 @@ mod tests {
 
     use json_rpc_2_runtime::TransportKind;
 
-    use super::validate_port_assignments;
+    use super::{parse_positive_usize, validate_port_assignments};
 
     #[test]
     fn allows_tcp_adapters_on_the_same_port() {
@@ -211,5 +260,12 @@ mod tests {
     fn rejects_zero_external_broker_port() {
         let ports = HashMap::from([(TransportKind::Mqtt, 0)]);
         assert!(validate_port_assignments(&ports).is_err());
+    }
+
+    #[test]
+    fn dispatch_limits_must_be_positive_integers() {
+        assert_eq!(parse_positive_usize("LIMIT", "12").unwrap(), 12);
+        assert!(parse_positive_usize("LIMIT", "0").is_err());
+        assert!(parse_positive_usize("LIMIT", "invalid").is_err());
     }
 }

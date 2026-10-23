@@ -134,7 +134,7 @@ impl WebSocketJsonRpcAdapter {
             let request = websocket_message_bytes(&inbound);
             let response = self
                 .protocol
-                .handle_message_with_context(&request, &context)
+                .handle_message_with_context(request, &context)
                 .await?;
             let outbound = match (is_text, std::str::from_utf8(&response)) {
                 (true, Ok(text)) => WebSocketMessage::Text(text.to_owned()),
