@@ -143,6 +143,192 @@ pub struct SessionRegistry {
     state: Arc<Mutex<RegistryState>>,
 }
 
+struct ManagedSession<T> {
+    identity: SessionIdentity,
+    value: T,
+}
+
+/// Result of applying broker metadata to the gateway-owned session runtime.
+pub enum SessionDispatch {
+    /// An application RPC was admitted. `identity` is absent for legacy
+    /// stateless publishers; identified requests carry a lease guard.
+    Rpc {
+        identity: Option<SessionIdentity>,
+        request: Option<SessionRequest>,
+    },
+    /// Lifecycle, push, malformed, expired, or otherwise rejected metadata.
+    Lifecycle,
+}
+
+/// Owns broker ingress-session lifecycle state and its associated resources.
+///
+/// Broker adapters supply a factory for transport-specific session resources,
+/// then apply the returned RPC disposition to their application handler.
+pub struct SessionRuntime<T> {
+    registry: SessionRegistry,
+    sessions: HashMap<String, ManagedSession<T>>,
+}
+
+impl<T> SessionRuntime<T> {
+    pub fn new(policy: BrokerSessionPolicy, max_sessions: usize) -> Result<Self, SessionError> {
+        Ok(Self {
+            registry: SessionRegistry::new(policy, max_sessions)?,
+            sessions: HashMap::new(),
+        })
+    }
+
+    /// Apply lifecycle metadata and admit identified RPC work through the lease registry.
+    pub fn dispatch(
+        &mut self,
+        metadata: &MessageMetadata,
+        now: Instant,
+        create: impl for<'a> Fn(&'a SessionIdentity) -> T,
+    ) -> SessionDispatch {
+        let Some(identity) = metadata.session.as_ref() else {
+            return if metadata.kind == MessageKind::Rpc {
+                SessionDispatch::Rpc {
+                    identity: None,
+                    request: None,
+                }
+            } else {
+                SessionDispatch::Lifecycle
+            };
+        };
+
+        match metadata.kind {
+            MessageKind::Open => {
+                if matches!(self.open(identity, now, create), Err(SessionError::Retired)) {
+                    self.remove_if_identity_matches(identity);
+                }
+                SessionDispatch::Lifecycle
+            }
+            MessageKind::Close => {
+                let _ = self.close_identity(identity, now);
+                SessionDispatch::Lifecycle
+            }
+            MessageKind::Heartbeat => {
+                if !self.registry.heartbeat(identity, now) {
+                    self.remove_if_identity_matches(identity);
+                }
+                SessionDispatch::Lifecycle
+            }
+            MessageKind::Rpc => match self.open(identity, now, create) {
+                Ok(()) => match self.registry.begin_request(identity, now) {
+                    Some(request) => SessionDispatch::Rpc {
+                        identity: Some(identity.clone()),
+                        request: Some(request),
+                    },
+                    None => {
+                        self.remove_if_identity_matches(identity);
+                        SessionDispatch::Lifecycle
+                    }
+                },
+                Err(SessionError::Retired) => {
+                    self.remove_if_identity_matches(identity);
+                    SessionDispatch::Lifecycle
+                }
+                Err(_) => SessionDispatch::Lifecycle,
+            },
+            MessageKind::Push => SessionDispatch::Lifecycle,
+        }
+    }
+
+    fn open(
+        &mut self,
+        identity: &SessionIdentity,
+        now: Instant,
+        create: impl FnOnce(&SessionIdentity) -> T,
+    ) -> Result<(), SessionError> {
+        match self.registry.open(identity.clone(), now) {
+            Ok(()) => {
+                self.sessions
+                    .entry(identity.id.clone())
+                    .or_insert_with(|| ManagedSession {
+                        identity: identity.clone(),
+                        value: create(identity),
+                    });
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Look up the transport resource only when the full identity still matches.
+    pub fn get(&self, identity: &SessionIdentity) -> Option<&T> {
+        self.sessions
+            .get(&identity.id)
+            .filter(|session| session.identity == *identity)
+            .map(|session| &session.value)
+    }
+
+    /// Close a session by its server-owned ID, for example after protocol close.
+    pub fn close(&mut self, id: &str, now: Instant) -> Option<T> {
+        let _ = self.registry.close(id, now)?;
+        self.sessions.remove(id).map(|session| session.value)
+    }
+
+    /// Close only when the supplied complete identity matches the active session.
+    pub fn close_identity(&mut self, identity: &SessionIdentity, now: Instant) -> Option<T> {
+        let registry_closed = self.registry.close_identity(identity, now).is_some();
+        let same_identity = self
+            .sessions
+            .get(&identity.id)
+            .is_some_and(|session| session.identity == *identity);
+        if !registry_closed && !same_identity {
+            return None;
+        }
+        self.sessions
+            .remove(&identity.id)
+            .map(|session| session.value)
+    }
+
+    /// Expire idle sessions and return their transport resources for cleanup.
+    pub fn expire(&mut self, now: Instant) -> Vec<T> {
+        self.registry
+            .expire(now)
+            .into_iter()
+            .filter_map(|identity| {
+                self.sessions
+                    .remove(&identity.id)
+                    .filter(|session| session.identity == identity)
+                    .map(|session| session.value)
+            })
+            .collect()
+    }
+
+    /// Retire sessions whose adapter-owned resource has failed.
+    pub fn remove_failed(&mut self, now: Instant, mut failed: impl FnMut(&T) -> bool) -> Vec<T> {
+        let failed_identities: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|session| failed(&session.value))
+            .map(|session| session.identity.clone())
+            .collect();
+        failed_identities
+            .into_iter()
+            .filter_map(|identity| self.close_identity(&identity, now))
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    fn remove_if_identity_matches(&mut self, identity: &SessionIdentity) {
+        if self
+            .sessions
+            .get(&identity.id)
+            .is_some_and(|session| session.identity == *identity)
+        {
+            self.sessions.remove(&identity.id);
+        }
+    }
+}
+
 impl SessionRegistry {
     pub fn new(policy: BrokerSessionPolicy, max_sessions: usize) -> Result<Self, SessionError> {
         policy.validate()?;
@@ -478,5 +664,190 @@ mod tests {
             Err(SessionError::CapacityReached)
         );
         assert!(registry.heartbeat(&session, start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn runtime_owns_metadata_dispatch_contexts_and_cleanup() {
+        let policy = BrokerSessionPolicy {
+            heartbeat_interval: Duration::from_secs(1),
+            session_lease: Duration::from_secs(5),
+        };
+        let mut runtime = SessionRuntime::new(policy, 2).unwrap();
+        let start = Instant::now();
+        let session = identity();
+        let created = std::cell::Cell::new(0);
+        let create = |_: &SessionIdentity| {
+            created.set(created.get() + 1);
+            String::from("context")
+        };
+
+        assert!(matches!(
+            runtime.dispatch(
+                &MessageMetadata {
+                    session: Some(session.clone()),
+                    kind: MessageKind::Open,
+                },
+                start,
+                create,
+            ),
+            SessionDispatch::Lifecycle
+        ));
+        assert!(matches!(
+            runtime.dispatch(
+                &MessageMetadata {
+                    session: Some(session.clone()),
+                    kind: MessageKind::Open,
+                },
+                start + Duration::from_millis(1),
+                create,
+            ),
+            SessionDispatch::Lifecycle
+        ));
+        assert_eq!(created.get(), 1);
+        assert_eq!(runtime.get(&session).map(String::as_str), Some("context"));
+
+        let dispatch = runtime.dispatch(
+            &MessageMetadata {
+                session: Some(session.clone()),
+                kind: MessageKind::Rpc,
+            },
+            start + Duration::from_millis(2),
+            create,
+        );
+        let SessionDispatch::Rpc {
+            identity: Some(dispatched_identity),
+            request: Some(request),
+        } = dispatch
+        else {
+            panic!("registered session RPC should be admitted");
+        };
+        assert_eq!(dispatched_identity, session);
+        assert_eq!(runtime.expire(start + policy.session_lease).len(), 0);
+        drop(request);
+        assert_eq!(
+            runtime.expire(Instant::now() + policy.session_lease).len(),
+            1
+        );
+        assert!(runtime.is_empty());
+
+        let stateless = runtime.dispatch(&MessageMetadata::default(), Instant::now(), create);
+        assert!(matches!(
+            stateless,
+            SessionDispatch::Rpc {
+                identity: None,
+                request: None
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_rejects_rebinding_and_retires_only_matching_routes() {
+        let mut runtime = SessionRuntime::new(BrokerSessionPolicy::default(), 2).unwrap();
+        let now = Instant::now();
+        let session = identity();
+        let create = |_: &SessionIdentity| String::from("context");
+        runtime.dispatch(
+            &MessageMetadata {
+                session: Some(session.clone()),
+                kind: MessageKind::Open,
+            },
+            now,
+            create,
+        );
+
+        let wrong_route =
+            SessionIdentity::new(session.id.clone(), "json-rpc-2/replies/other").unwrap();
+        assert!(runtime.close_identity(&wrong_route, now).is_none());
+        assert!(runtime.get(&session).is_some());
+
+        assert!(matches!(
+            runtime.dispatch(
+                &MessageMetadata {
+                    session: Some(wrong_route),
+                    kind: MessageKind::Rpc,
+                },
+                now,
+                create,
+            ),
+            SessionDispatch::Lifecycle
+        ));
+        assert!(runtime.get(&session).is_some());
+        assert_eq!(
+            runtime.close_identity(&session, now).as_deref(),
+            Some("context")
+        );
+        assert!(runtime.is_empty());
+    }
+
+    #[test]
+    fn runtime_retires_failed_adapter_resources() {
+        let mut runtime = SessionRuntime::new(BrokerSessionPolicy::default(), 2).unwrap();
+        let now = Instant::now();
+        let session = identity();
+        runtime.dispatch(
+            &MessageMetadata {
+                session: Some(session.clone()),
+                kind: MessageKind::Open,
+            },
+            now,
+            |_: &SessionIdentity| true,
+        );
+        assert_eq!(runtime.remove_failed(now, |failed| *failed), vec![true]);
+        assert!(runtime.get(&session).is_none());
+        assert!(matches!(
+            runtime.dispatch(
+                &MessageMetadata {
+                    session: Some(session),
+                    kind: MessageKind::Open,
+                },
+                now,
+                |_: &SessionIdentity| true,
+            ),
+            SessionDispatch::Lifecycle
+        ));
+    }
+
+    #[test]
+    fn runtime_removes_resources_when_a_late_heartbeat_expires_the_lease() {
+        let policy = BrokerSessionPolicy {
+            heartbeat_interval: Duration::from_secs(1),
+            session_lease: Duration::from_secs(3),
+        };
+        let mut runtime = SessionRuntime::new(policy, 1).unwrap();
+        let start = Instant::now();
+        let session = identity();
+        runtime.dispatch(
+            &MessageMetadata {
+                session: Some(session.clone()),
+                kind: MessageKind::Open,
+            },
+            start,
+            |_: &SessionIdentity| String::from("context"),
+        );
+
+        assert!(matches!(
+            runtime.dispatch(
+                &MessageMetadata {
+                    session: Some(session.clone()),
+                    kind: MessageKind::Heartbeat,
+                },
+                start + policy.session_lease,
+                |_: &SessionIdentity| String::from("unused"),
+            ),
+            SessionDispatch::Lifecycle
+        ));
+        assert!(runtime.is_empty());
+        assert!(matches!(
+            runtime.dispatch(
+                &MessageMetadata {
+                    session: Some(session.clone()),
+                    kind: MessageKind::Rpc,
+                },
+                start + policy.session_lease,
+                |_: &SessionIdentity| String::from("must not recreate"),
+            ),
+            SessionDispatch::Lifecycle
+        ));
+        assert!(runtime.is_empty());
     }
 }
