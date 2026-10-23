@@ -96,7 +96,13 @@ impl WebSocketJsonRpcAdapter {
         Box::pin(async move {
             let inbound = match decode_websocket_message(input) {
                 Ok(Some(inbound)) => inbound,
-                Ok(None) => return None,
+                Ok(None) => {
+                    if let Some(session) = self.sessions.lock().unwrap().get(&context.connection_id)
+                    {
+                        session.closing.store(true, Ordering::Release);
+                    }
+                    return None;
+                }
                 Err(error) => {
                     log_transport_error(self.kind, &context.connection_id, "decode frame", &error);
                     if let Some(session) = self.sessions.lock().unwrap().get(&context.connection_id)
@@ -105,6 +111,24 @@ impl WebSocketJsonRpcAdapter {
                     }
                     return None;
                 }
+            };
+            let inbound = match inbound {
+                WebSocketMessage::Ping(payload) => {
+                    return match encode_websocket_message(&WebSocketMessage::Pong(payload)) {
+                        Ok(frame) => Some(Bytes::from(frame)),
+                        Err(error) => {
+                            log_transport_error(
+                                self.kind,
+                                &context.connection_id,
+                                "encode pong",
+                                &error,
+                            );
+                            None
+                        }
+                    };
+                }
+                WebSocketMessage::Pong(_) => return None,
+                message @ (WebSocketMessage::Text(_) | WebSocketMessage::Binary(_)) => message,
             };
             let is_text = matches!(inbound, WebSocketMessage::Text(_));
             let request = websocket_message_bytes(&inbound);
@@ -116,7 +140,18 @@ impl WebSocketJsonRpcAdapter {
                 (true, Ok(text)) => WebSocketMessage::Text(text.to_owned()),
                 _ => WebSocketMessage::Binary(response),
             };
-            encode_websocket_message(&outbound).ok().map(Bytes::from)
+            match encode_websocket_message(&outbound) {
+                Ok(frame) => Some(Bytes::from(frame)),
+                Err(error) => {
+                    log_transport_error(
+                        self.kind,
+                        &context.connection_id,
+                        "encode response",
+                        &error,
+                    );
+                    None
+                }
+            }
         })
     }
 }
@@ -169,5 +204,46 @@ impl WebSocketJsonRpcAdapter {
             .unwrap()
             .get(&context.connection_id)
             .is_some_and(|session| session.closing.load(Ordering::Acquire))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RejectRpc;
+
+    impl JsonRpcProtocol for RejectRpc {
+        fn handle_message<'a>(&'a self, _: &'a [u8]) -> ProtocolFuture<'a> {
+            panic!("WebSocket control frames must not reach the JSON-RPC protocol")
+        }
+    }
+
+    #[tokio::test]
+    async fn control_ping_returns_same_payload_pong_without_rpc_dispatch() {
+        let adapter = WebSocketJsonRpcAdapter::new(Arc::new(RejectRpc), "ws-mqtt");
+        let payload = Bytes::from_static(b"broker-ping");
+        let ping = encode_websocket_message(&WebSocketMessage::Ping(payload.clone())).unwrap();
+        let response = adapter.handle_message(&ping).await.unwrap();
+        assert_eq!(
+            decode_websocket_message(&response).unwrap(),
+            Some(WebSocketMessage::Pong(payload))
+        );
+    }
+
+    #[tokio::test]
+    async fn close_control_frame_requests_session_cleanup() {
+        let adapter = WebSocketJsonRpcAdapter::new(Arc::new(RejectRpc), "ws-mqtt");
+        let session = TransportSession::new("ws-mqtt", true);
+        adapter.session_opened(&session.context);
+        let close = json_rpc_2_core::encode_websocket_close_frame().unwrap();
+        assert!(
+            adapter
+                .handle_message_with_context(&close, &session.context)
+                .await
+                .is_none()
+        );
+        assert!(adapter.session_close_requested(&session.context));
+        adapter.session_closed(&session.context);
     }
 }
