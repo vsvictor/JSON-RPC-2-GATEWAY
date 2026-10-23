@@ -11,6 +11,7 @@ anyhow = "1"
 bytes = "1"
 gateway-protocol = { path = "../gateway-protocol" }
 gateway-sessions.workspace = true
+gateway-iot.workspace = true
 json-rpc-2-transport.workspace = true
 json-rpc-2-tcp.workspace = true
 json-rpc-2-quic.workspace = true

@@ -39,11 +39,11 @@ use json_rpc_2_datagram::server::transports::udp::UdpTransport;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use json_rpc_2_datagram::server::transports::udplite::UdpLiteTransport;
 
-pub use json_rpc_2_iot::AmqpConfig;
+pub use gateway_iot::AmqpConfig;
 
-pub use json_rpc_2_iot::MqttConfig;
+pub use gateway_iot::MqttConfig;
 
-use json_rpc_2_iot::server::transports::coap::CoapTransport;
+use gateway_iot::server::transports::coap::CoapTransport;
 
 use json_rpc_2_server::JsonRpcProtocol;
 
@@ -51,7 +51,7 @@ use json_rpc_2_transport::TLS_ALPN;
 use json_rpc_2_transport::TcpTuningConfig;
 use json_rpc_2_transport::{RunningTransport, Transport, TransportRuntime};
 
-use json_rpc_2_websockets::server::transports::coap::CoapWebSocketTransport;
+use gateway_iot::server::transports::coap_websocket::CoapWebSocketTransport;
 
 use json_rpc_2_websockets::server::transports::rtp::RtpWebSocketTransport;
 
@@ -80,6 +80,7 @@ pub struct GatewayIngress {
     udp_lite_config: UdpLiteConfig,
     #[cfg(feature = "srt")]
     srt_config: Option<SrtConfig>,
+    iot: gateway_iot::GatewayIotIngress,
     standalone: MultiTransportServer,
 }
 
@@ -94,6 +95,7 @@ impl GatewayIngress {
             udp_lite_config: Default::default(),
             #[cfg(feature = "srt")]
             srt_config: None,
+            iot: gateway_iot::GatewayIotIngress::default(),
         }
     }
 
@@ -105,6 +107,21 @@ impl GatewayIngress {
 
     pub fn set_port(&mut self, kind: TransportKind, port: u16) -> &mut Self {
         self.ports.insert(kind, port);
+        match kind.id() {
+            "mqtt" => {
+                self.iot.set_mqtt_port(port);
+            }
+            "ws-mqtt" => {
+                self.iot.set_ws_mqtt_port(port);
+            }
+            "amqp" => {
+                self.iot.set_amqp_port(port);
+            }
+            "ws-amqp" => {
+                self.iot.set_ws_amqp_port(port);
+            }
+            _ => {}
+        }
         self
     }
 
@@ -140,21 +157,21 @@ impl GatewayIngress {
     }
 
     pub fn set_mqtt_config(&mut self, config: MqttConfig) -> &mut Self {
-        self.standalone.set_mqtt_config(config);
+        self.iot.set_mqtt_config(config);
         self
     }
     #[cfg(feature = "websocket")]
     pub fn set_ws_mqtt_config(&mut self, config: MqttConfig) -> &mut Self {
-        self.standalone.set_ws_mqtt_config(config);
+        self.iot.set_ws_mqtt_config(config);
         self
     }
     pub fn set_amqp_config(&mut self, config: AmqpConfig) -> &mut Self {
-        self.standalone.set_amqp_config(config);
+        self.iot.set_amqp_config(config);
         self
     }
     #[cfg(feature = "websocket")]
     pub fn set_ws_amqp_config(&mut self, config: AmqpConfig) -> &mut Self {
-        self.standalone.set_ws_amqp_config(config);
+        self.iot.set_ws_amqp_config(config);
         self
     }
 
@@ -169,6 +186,16 @@ impl GatewayIngress {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "no ingress bind address",
+            ));
+        }
+        if self
+            .ports
+            .iter()
+            .any(|(kind, port)| kind.is_broker() && *port == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "broker transport port must be nonzero",
             ));
         }
         self.udp_lite_config
@@ -197,9 +224,10 @@ impl GatewayIngress {
         let mut running = RunningIngress {
             listeners: Vec::new(),
             standalone: None,
+            iot: None,
         };
         for kinds in groups {
-            if kinds.len() == 1 {
+            if kinds.len() == 1 && !is_iot_datagram(kinds[0]) {
                 self.standalone.set_port(kinds[0], self.ports[&kinds[0]]);
                 continue;
             }
@@ -219,12 +247,6 @@ impl GatewayIngress {
                 }
             }
         }
-        for (&kind, &port) in &self.ports {
-            // Explicit broker configurations already set their upstream kind.
-            if kind.is_broker() && !self.standalone.transports().any(|enabled| enabled == kind) {
-                self.standalone.set_port(kind, port);
-            }
-        }
         if self.standalone.transports().next().is_some() {
             match self.standalone.start().await {
                 Ok(server) => running.standalone = Some(server),
@@ -234,6 +256,15 @@ impl GatewayIngress {
                     }
                     return Err(error);
                 }
+            }
+        }
+        match self.iot.start(self.protocol.clone(), runtime).await {
+            Ok(iot) => running.iot = Some(iot),
+            Err(error) => {
+                if let Err(close) = running.close().await {
+                    tracing::error!(%close, "failed to close partially started ingress");
+                }
+                return Err(error);
             }
         }
         Ok(running)
@@ -490,7 +521,7 @@ impl GatewayIngress {
 
                             TransportKind::WebSocketCoap => CoapWebSocketTransport::new(source)
                                 .with_runtime(runtime.clone())
-                                .start(websocket.clone()),
+                                .start(protocol.clone()),
                             #[cfg(any(target_os = "linux", target_os = "android"))]
                             TransportKind::WebSocketUdpLite => {
                                 UdpLiteWebSocketTransport::new(source)
@@ -625,6 +656,7 @@ struct Listener {
 pub struct RunningIngress {
     listeners: Vec<Listener>,
     standalone: Option<RunningServer>,
+    iot: Option<gateway_iot::RunningGatewayIot>,
 }
 
 impl RunningIngress {
@@ -647,8 +679,17 @@ impl RunningIngress {
         {
             GatewayIngress::log_shared_close_error(&mut result, error);
         }
+        if let Some(iot) = self.iot
+            && let Err(error) = iot.close().await
+        {
+            GatewayIngress::log_shared_close_error(&mut result, error);
+        }
         result
     }
+}
+
+fn is_iot_datagram(kind: TransportKind) -> bool {
+    matches!(kind.id(), "coap" | "ws-coap")
 }
 /// A socket bound to `address`. An IPv6 socket accepts IPv6 only
 /// (`IPV6_V6ONLY`), so `0.0.0.0` and `::` can be bound side by side on every OS.

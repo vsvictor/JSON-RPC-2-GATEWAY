@@ -1,6 +1,7 @@
 use std::{collections::HashMap, env, fs, net::IpAddr, path::PathBuf};
 
 use anyhow::{Context, bail};
+use gateway_iot::GatewayIotConfig;
 use json_rpc_2_runtime::TransportKind;
 use json_rpc_balancer::BackendConfig;
 use serde::Deserialize;
@@ -14,8 +15,7 @@ pub struct GatewayConfig {
     pub transport_ports: HashMap<TransportKind, u16>,
     pub tls_cert_path: Option<PathBuf>,
     pub tls_key_path: Option<PathBuf>,
-    pub mqtt_broker_url: Option<String>,
-    pub amqp_broker_url: Option<String>,
+    pub iot: GatewayIotConfig,
 }
 
 #[derive(Deserialize)]
@@ -24,31 +24,6 @@ struct BackendFile {
 }
 
 impl GatewayConfig {
-    pub fn broker_sessions(&self) -> anyhow::Result<gateway_sessions::BrokerSessionPolicy> {
-        let mut policy = gateway_sessions::BrokerSessionPolicy::default();
-        for (name, duration) in [
-            (
-                "GATEWAY_BROKER_HEARTBEAT_INTERVAL_MS",
-                &mut policy.heartbeat_interval,
-            ),
-            ("GATEWAY_BROKER_SESSION_LEASE_MS", &mut policy.session_lease),
-        ] {
-            match env::var(name) {
-                Ok(value) => {
-                    *duration = std::time::Duration::from_millis(
-                        value
-                            .parse()
-                            .with_context(|| format!("{name} must be milliseconds"))?,
-                    );
-                }
-                Err(env::VarError::NotPresent) => {}
-                Err(error) => return Err(error).with_context(|| format!("reading {name}")),
-            }
-        }
-        policy.validate()?;
-        Ok(policy)
-    }
-
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn udplite_config(&self) -> anyhow::Result<json_rpc_2_datagram::UdpLiteConfig> {
         let mut config = json_rpc_2_datagram::UdpLiteConfig::default();
@@ -127,6 +102,9 @@ impl GatewayConfig {
 
         validate_port_assignments(&transport_ports)?;
 
+        let iot = GatewayIotConfig::from_env(transport_ports.keys().any(|kind| kind.is_broker()))
+            .context("loading gateway IoT configuration")?;
+
         Ok(Self {
             bind,
             control_port,
@@ -135,8 +113,7 @@ impl GatewayConfig {
             transport_ports,
             tls_cert_path: env::var_os("TLS_CERT_PATH").map(PathBuf::from),
             tls_key_path: env::var_os("TLS_KEY_PATH").map(PathBuf::from),
-            mqtt_broker_url: env::var("MQTT_BROKER_URL").ok(),
-            amqp_broker_url: env::var("AMQP_BROKER_URL").ok(),
+            iot,
         })
     }
 

@@ -4,7 +4,7 @@ This workspace separates ingress/session concerns from backend selection:
 
 - `json-rpc-gateway` is the transport-facing adapter, message bus, configuration loader, and Control Plane.
 - `json-rpc-balancer` owns backend endpoint validation, load-balancing strategy, and persistent backend connection pools.
-- `gateway-sessions` is a separately consumable crate for broker session identity, lifecycle metadata, heartbeat/lease policy, and runtime orchestration. Its `SessionRuntime` validates metadata, applies lifecycle transitions, admits RPC work, and owns transport session resources; JSON-RPC-2 retains broker I/O and transport-specific session construction.
+- `gateway-iot` owns IoT server adapters, broker ingress configuration, and server-side broker I/O; `json-rpc-2-iot` retains client transports. `gateway-sessions` is a separately consumable crate for broker session identity, lifecycle metadata, heartbeat/lease policy, and runtime orchestration. Its `SessionRuntime` validates metadata, applies lifecycle transitions, admits RPC work, and owns transport session resources.
 - JSON-RPC-2 is fetched directly from the upstream [`start` branch](https://github.com/vsvictor/JSON-RPC-2/tree/start), which provides reusable accepted-I/O, session, push and transport framing APIs. The workspace-owned `gateway-protocol` crate defines the private gateway/backend envelope and backend adapter. `Cargo.lock` pins the resolved commit; no local upstream checkout is required.
 
 To adopt new JSON-RPC-2 changes, run `cargo update -p json-rpc-2-runtime -p json-rpc-2-server`, then rebuild and test the workspace. Keep the updated `Cargo.lock` with the project so normal builds use the same library revision.

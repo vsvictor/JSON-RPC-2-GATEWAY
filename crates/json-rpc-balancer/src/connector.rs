@@ -34,14 +34,6 @@ pub(crate) async fn connect(
         .await?
         .next()
         .context("backend host resolved to no addresses")?;
-    fn broker_sessions(config: &BackendConfig) -> gateway_sessions::BrokerSessionPolicy {
-        gateway_sessions::BrokerSessionPolicy {
-            heartbeat_interval: std::time::Duration::from_millis(
-                config.options.broker_heartbeat_interval_ms,
-            ),
-            session_lease: std::time::Duration::from_millis(config.options.broker_session_lease_ms),
-        }
-    }
     macro_rules! simple {
         ($client:ty) => {
             Arc::new(<$client>::connect(address).await?) as Arc<dyn RpcClientTransport>
@@ -139,7 +131,8 @@ pub(crate) async fn connect(
         }
         "mqtt" | "ws-mqtt" => {
             let mut broker = json_rpc_2_iot::MqttConfig::for_address(address);
-            broker.sessions = broker_sessions(config);
+            broker.heartbeat_interval =
+                std::time::Duration::from_millis(config.options.broker_heartbeat_interval_ms);
             if let Some(variable) = &config.options.mqtt_url_env {
                 broker.broker_url = std::env::var(variable)
                     .context("missing MQTT backend URL environment variable")?;
@@ -164,7 +157,8 @@ pub(crate) async fn connect(
         }
         "amqp" | "ws-amqp" => {
             let mut broker = json_rpc_2_iot::AmqpConfig::for_address(address);
-            broker.sessions = broker_sessions(config);
+            broker.heartbeat_interval =
+                std::time::Duration::from_millis(config.options.broker_heartbeat_interval_ms);
             if let Some(variable) = &config.options.amqp_url_env {
                 broker.broker_url = std::env::var(variable)
                     .context("missing AMQP backend URL environment variable")?;

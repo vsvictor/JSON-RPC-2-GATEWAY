@@ -336,7 +336,7 @@ impl BackendPool {
                         "backend {} transport {kind} exchange failed",
                         backend.config.id
                     )
-                })
+                });
             }
             Err(_) => anyhow::bail!(
                 "backend {} transport {kind} exchange timed out; request was not replayed",
@@ -492,27 +492,47 @@ mod tests {
         mut settings: BackendConfig,
         mut server: MultiTransportServer,
     ) {
-        let broker = matches!(
-            kind,
-            TransportKind::Mqtt
-                | TransportKind::WebSocketMqtt
-                | TransportKind::Amqp
-                | TransportKind::WebSocketAmqp
-        );
         server.set_bind(["127.0.0.1".parse().unwrap()]);
-        if !broker {
-            server.set_port(kind, 0);
-        }
+        server.set_port(kind, 0);
         let running = server.start().await.unwrap();
-        if !broker {
-            let (_, address) = running
-                .listeners()
-                .find(|(candidate, _)| *candidate == kind)
-                .unwrap();
-            settings.ports = [(kind.id().to_owned(), address.port())]
-                .into_iter()
-                .collect();
+        let (_, address) = running
+            .listeners()
+            .find(|(candidate, _)| *candidate == kind)
+            .unwrap();
+        settings.ports = [(kind.id().to_owned(), address.port())]
+            .into_iter()
+            .collect();
+        let pool = BackendPool::new(vec![settings]).unwrap();
+        pool.warm_up().await.unwrap();
+        for _ in 0..2 {
+            assert!(pool
+                .forward(&Bytes::new(), "ws-tls", "opaque-client")
+                .await
+                .unwrap()
+                .is_none());
+            let payload = Bytes::from_static(b"\0\xff\r\nopaque-payload");
+            assert_eq!(
+                pool.forward(&payload, "ws-tls", "opaque-client")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                payload
+            );
         }
+        drop(pool);
+        running.close().await.unwrap();
+    }
+
+    async fn assert_opaque_broker_backend(
+        settings: BackendConfig,
+        ingress: gateway_iot::server::GatewayIotIngress,
+    ) {
+        use json_rpc_2_transport::TransportRuntime;
+
+        let running = ingress
+            .start(Arc::new(OpaqueEcho), Arc::new(TransportRuntime::default()))
+            .await
+            .unwrap();
         let pool = BackendPool::new(vec![settings]).unwrap();
         pool.warm_up().await.unwrap();
         for _ in 0..2 {
@@ -624,9 +644,7 @@ mod tests {
             TransportKind::WebSocketAmqp,
         ] {
             let mut settings = config(1, kind.id());
-            let mut server = MultiTransportServer::new(Arc::new(
-                gateway_protocol::GatewayBackendProtocol::new(Arc::new(OpaqueEcho)),
-            ));
+            let mut ingress = gateway_iot::server::GatewayIotIngress::default();
             let namespace = format!(
                 "compat-{}-{}",
                 std::process::id(),
@@ -643,13 +661,22 @@ mod tests {
                         request_topic: format!("json-rpc-2/{namespace}/requests"),
                         ..Default::default()
                     };
+                    let ingress_config = gateway_iot::MqttConfig {
+                        broker_url: broker.broker_url.clone(),
+                        request_topic: broker.request_topic.clone(),
+                        operation_timeout: broker.operation_timeout,
+                        response_timeout: broker.response_timeout,
+                        max_payload_bytes: broker.max_payload_bytes,
+                        ca_certificate: broker.ca_certificate.clone(),
+                        ..Default::default()
+                    };
                     settings.options.mqtt_url_env = Some("MQTT_BROKER_URL".into());
                     if kind == TransportKind::Mqtt {
                         settings.options.mqtt_request_topic = Some(broker.request_topic.clone());
-                        server.set_mqtt_config(broker);
+                        ingress.set_mqtt_config(ingress_config);
                     } else {
                         settings.options.ws_mqtt_request_topic = Some(broker.request_topic.clone());
-                        server.set_ws_mqtt_config(broker);
+                        ingress.set_ws_mqtt_config(ingress_config);
                     }
                 }
                 _ => {
@@ -659,17 +686,26 @@ mod tests {
                         request_queue: format!("json-rpc-2.{namespace}.requests"),
                         ..Default::default()
                     };
+                    let ingress_config = gateway_iot::AmqpConfig {
+                        broker_url: broker.broker_url.clone(),
+                        request_queue: broker.request_queue.clone(),
+                        operation_timeout: broker.operation_timeout,
+                        response_timeout: broker.response_timeout,
+                        max_payload_bytes: broker.max_payload_bytes,
+                        prefetch: broker.prefetch,
+                        ..Default::default()
+                    };
                     settings.options.amqp_url_env = Some("AMQP_BROKER_URL".into());
                     if kind == TransportKind::Amqp {
                         settings.options.amqp_request_queue = Some(broker.request_queue.clone());
-                        server.set_amqp_config(broker);
+                        ingress.set_amqp_config(ingress_config);
                     } else {
                         settings.options.ws_amqp_request_queue = Some(broker.request_queue.clone());
-                        server.set_ws_amqp_config(broker);
+                        ingress.set_ws_amqp_config(ingress_config);
                     }
                 }
             }
-            assert_opaque_backend(kind, settings, server).await;
+            assert_opaque_broker_backend(settings, ingress).await;
         }
     }
 
@@ -681,13 +717,11 @@ mod tests {
             TransportKind::Udp,
             TransportKind::Rudp,
             TransportKind::Rtp,
-            TransportKind::Coap,
             TransportKind::WebSocketTcp,
             TransportKind::WebSocketHttp1,
             TransportKind::WebSocketUdp,
             TransportKind::WebSocketRtp,
             TransportKind::WebSocketRudp,
-            TransportKind::WebSocketCoap,
         ] {
             let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = probe.local_addr().unwrap().port();
@@ -744,6 +778,71 @@ mod tests {
                 kind.id()
             );
             drop(slot);
+            drop(pool);
+            running.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn coap_carriers_preserve_metadata_notifications_and_reuse() {
+        use json_rpc_2_transport::{Transport, TransportRuntime};
+
+        for kind in [TransportKind::Coap, TransportKind::WebSocketCoap] {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = socket.local_addr().unwrap();
+            let rpc = Arc::new(RpcServer::new());
+            rpc.register_with_context("echo", |params, context| async move {
+                let context = context.unwrap();
+                assert_eq!(context.connection_id, "client-1");
+                assert_eq!(context.transport, "ws-tcp");
+                Ok(params)
+            })
+            .unwrap();
+            let protocol: Arc<dyn json_rpc_2_transport::JsonRpcProtocol> =
+                Arc::new(gateway_protocol::GatewayBackendProtocol::new(rpc));
+            let runtime = Arc::new(TransportRuntime::default());
+            let running = match kind {
+                TransportKind::Coap => {
+                    gateway_iot::server::transports::coap::CoapTransport::new(socket)
+                        .with_runtime(runtime)
+                        .start(protocol)
+                }
+                TransportKind::WebSocketCoap => {
+                    gateway_iot::server::transports::coap_websocket::CoapWebSocketTransport::new(
+                        socket,
+                    )
+                    .with_runtime(runtime)
+                    .start(protocol)
+                }
+                _ => unreachable!(),
+            };
+            let pool = BackendPool::new(vec![config(address.port(), kind.id())]).unwrap();
+            pool.warm_up().await.unwrap();
+            for _ in 0..2 {
+                let notification =
+                    Bytes::from_static(b"{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"params\":[1]}");
+                assert!(
+                    pool.forward(&notification, "ws-tcp", "client-1")
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{}",
+                    kind.id()
+                );
+                let request = Bytes::from_static(
+                    b"{\n\"jsonrpc\":\"2.0\",\n\"method\":\"echo\",\"params\":{\"value\":1},\"id\":7\n}",
+                );
+                let response = pool
+                    .forward(&request, "ws-tcp", "client-1")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&response).unwrap()["result"]
+                        ["value"],
+                    1
+                );
+            }
             drop(pool);
             running.close().await.unwrap();
         }

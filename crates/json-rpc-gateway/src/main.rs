@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use config::GatewayConfig;
 use gateway::Gateway;
 use ingress::GatewayIngress;
-use json_rpc_2_runtime::{AmqpConfig, MqttConfig, TransportKind};
+use json_rpc_2_runtime::TransportKind;
 use json_rpc_balancer::BackendPool;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
@@ -39,11 +39,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_context(|| format!("binding Control Plane at {control_address}"))?;
     let mut server = GatewayIngress::new(gateway.multiplexed_protocol());
     server.set_bind([config.bind]);
-    let broker_sessions = if config.transport_ports.keys().any(|kind| kind.is_broker()) {
-        Some(config.broker_sessions()?)
-    } else {
-        None
-    };
     #[cfg(any(target_os = "linux", target_os = "android"))]
     server.set_udplite_config(udplite_config);
     #[cfg(feature = "srt")]
@@ -54,59 +49,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         server.set_port(kind, port);
 
         if kind.id() == "mqtt" {
-            let broker_url = config
-                .mqtt_broker_url
-                .as_deref()
-                .context("MQTT_BROKER_URL is required when MQTT transport is enabled")?;
-            let mqtt = MqttConfig {
-                sessions: broker_sessions.context("broker session policy was not initialized")?,
-                broker_url: broker_url.to_owned(),
-                ..Default::default()
-            };
-            server.set_mqtt_config(mqtt);
+            server.set_mqtt_config(config.iot.mqtt_config(false)?);
         }
 
         #[cfg(feature = "websocket")]
         if kind.id() == "ws-mqtt" {
-            let broker_url = config
-                .mqtt_broker_url
-                .as_deref()
-                .context("MQTT_BROKER_URL is required when MQTT transport is enabled")?;
-            let mqtt = MqttConfig {
-                sessions: broker_sessions.context("broker session policy was not initialized")?,
-                broker_url: broker_url.to_owned(),
-                request_topic: "json-rpc-2/ws/requests".to_owned(),
-                ..Default::default()
-            };
-            server.set_ws_mqtt_config(mqtt);
+            server.set_ws_mqtt_config(config.iot.mqtt_config(true)?);
         }
 
         if kind.id() == "amqp" {
-            let broker_url = config
-                .amqp_broker_url
-                .as_deref()
-                .context("AMQP_BROKER_URL is required when AMQP transport is enabled")?;
-            let amqp = AmqpConfig {
-                sessions: broker_sessions.context("broker session policy was not initialized")?,
-                broker_url: broker_url.to_owned(),
-                ..Default::default()
-            };
-            server.set_amqp_config(amqp);
+            server.set_amqp_config(config.iot.amqp_config(false)?);
         }
 
         #[cfg(feature = "websocket")]
         if kind.id() == "ws-amqp" {
-            let broker_url = config
-                .amqp_broker_url
-                .as_deref()
-                .context("AMQP_BROKER_URL is required when AMQP transport is enabled")?;
-            let amqp = AmqpConfig {
-                sessions: broker_sessions.context("broker session policy was not initialized")?,
-                broker_url: broker_url.to_owned(),
-                request_queue: "json-rpc-2.ws.requests".to_owned(),
-                ..Default::default()
-            };
-            server.set_ws_amqp_config(amqp);
+            server.set_ws_amqp_config(config.iot.amqp_config(true)?);
         }
     }
     if config

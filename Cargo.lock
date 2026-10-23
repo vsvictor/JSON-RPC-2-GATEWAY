@@ -905,6 +905,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-iot"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "gateway-sessions",
+ "json-rpc-2-core",
+ "json-rpc-2-transport",
+ "lapin",
+ "rumqttc",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "gateway-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1431,7 +1451,6 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-core"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#974ba6460238091fe592abe99c4af3cb7edb36e6"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -1443,7 +1462,6 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-datagram"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#974ba6460238091fe592abe99c4af3cb7edb36e6"
 dependencies = [
  "bytes",
  "json-rpc-2-core",
@@ -1458,11 +1476,9 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-iot"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#974ba6460238091fe592abe99c4af3cb7edb36e6"
 dependencies = [
  "bytes",
  "futures-util",
- "gateway-sessions",
  "json-rpc-2-core",
  "json-rpc-2-transport",
  "lapin",
@@ -1478,7 +1494,6 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-quic"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#974ba6460238091fe592abe99c4af3cb7edb36e6"
 dependencies = [
  "axum",
  "base64",
@@ -1500,7 +1515,6 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-runtime"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#974ba6460238091fe592abe99c4af3cb7edb36e6"
 dependencies = [
  "axum",
  "base64",
@@ -1511,7 +1525,6 @@ dependencies = [
  "http",
  "json-rpc-2-core",
  "json-rpc-2-datagram",
- "json-rpc-2-iot",
  "json-rpc-2-quic",
  "json-rpc-2-server",
  "json-rpc-2-tcp",
@@ -1531,7 +1544,6 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-server"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#974ba6460238091fe592abe99c4af3cb7edb36e6"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1546,7 +1558,6 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-tcp"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#974ba6460238091fe592abe99c4af3cb7edb36e6"
 dependencies = [
  "axum",
  "bytes",
@@ -1567,7 +1578,6 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-transport"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#974ba6460238091fe592abe99c4af3cb7edb36e6"
 dependencies = [
  "bytes",
  "http-body",
@@ -1585,7 +1595,6 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-websockets"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#974ba6460238091fe592abe99c4af3cb7edb36e6"
 dependencies = [
  "axum",
  "base64",
@@ -1617,6 +1626,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "gateway-iot",
  "gateway-protocol",
  "gateway-sessions",
  "json-rpc-2-datagram",
@@ -1646,6 +1656,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "futures-util",
+ "gateway-iot",
  "gateway-protocol",
  "gateway-sessions",
  "h3",
