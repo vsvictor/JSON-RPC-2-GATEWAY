@@ -171,6 +171,10 @@ METRICS_PORT=9090
 | `BACKEND_CONFIG_PATH` | так | Шлях до backend JSON/YAML файлу з попереднього розділу. Відносні шляхи залежать від робочого каталогу процесу. |
 | `LOG_LEVEL` | так | `tracing` filter, наприклад `info`, `debug`, або детальніший фільтр за target. `debug` виводить повні request/response payload-и, тому використовуйте його лише контрольовано. Gateway використовує `LOG_LEVEL`, не `RUST_LOG`, для фільтрації. |
 
+Gateway записує tracing-події, включно з balancer і бібліотечними подіями, у stdout окремим worker-потоком через bounded чергу на 1024 записи. Форматування залишається в потоці, що створює подію, але повільний stdout/journald не блокує RPC-задачі на I/O. При переповненні нові записи будь-якого рівня відкидаються; Prometheus-лічильник `gateway_log_records_dropped_total` оновлюється раз на секунду. Він вимірює втрати черги, не помилки подальшої доставки stdout/journald. При штатному завершенні (Ctrl+C або Unix SIGTERM) guard робить обмежену в часі спробу дописати чергу й повідомляє кількість втрат у stderr; аварійне завершення може втратити записи. Нових `.env` параметрів немає.
+
+Demo backend використовує такий самий неблокувальний writer із `LOG_LEVEL=info` за замовчуванням і повідомляє втрати у stderr під час завершення; окремого metrics endpoint у нього немає. Upstream CLI також має незалежну bounded чергу на 1024 tracing-записи та stderr-звіт про втрати при завершенні, але використовує `RUST_LOG`, а не `LOG_LEVEL`. Явно некоректний `RUST_LOG` завершує CLI з помилкою; звичайний CLI-вивід `println!` залишається синхронним. Бібліотеки не встановлюють глобальний subscriber: у власному прикладному backend-і його налаштовує застосунок.
+
 ### Ingress, concurrency та metrics
 
 | Змінна | Default | Призначення / правила |
@@ -450,9 +454,211 @@ TLS key, backend config і `.env` мають бути доступні кори�
 ./scripts/deploy-lan-ecosystem.sh
 ```
 
-Цей скрипт запускає саме demo backend з методами `echo` та `identify`, а не невідомий прикладний backend: в репозиторії немає готового сервера з бізнесовими RPC методами. `identify` повертає ID вибраного backend-а, тож його можна використати для перевірки round-robin. Демонстраційні backend-и приймають TCP і UDP на однакових числових портах. Щоб розгорнути production застосунок, замініть demo binary та його systemd launch configuration на backend, що реалізує `GatewayBackendProtocol`. Скрипт не змінює firewall. Якщо gateway має бути доступним лише з цієї LAN, дозвольте на `.132` TCP/UDP ingress з `192.168.1.0/24` (наприклад, `sudo ufw allow from 192.168.1.0/24 to any port 18080 proto tcp` та аналогічно `proto udp`); не відкривайте `CONTROL_PORT=18500` публічно. Backend порти `18081`/`18082` обмежте до gateway-вузла. Повторний запуск оновлює бінарники/конфіги й перезапускає services.
+### LAN: усі доступні протоколи на одному порту
+
+На `.132` gateway налаштовано на `18080` для TCP/TLS/HTTP1, UDP/RTP/RUDP/SRT,
+QUIC/HTTP3/CoAP, SCTP/UDP-Lite та відповідних `ws-*` варіантів.
+Це 24 socket profiles; DCCP та `ws-dccp` не ввімкнено, бо ядро вузла
+не підтримує DCCP. Сертифікат і ключ встановлено в
+`/etc/json-rpc-ecosystem/tls/` із правами `root:jsonrpc 0640`.
+Оновлений сертифікат покриває DNS-імена `express-t.local`, `localhost`
+та IP `127.0.0.1`, `192.168.1.132`. Для TLS/QUIC використовуйте server name
+`express-t.local` або IP `192.168.1.132`; клієнт має довіряти новому
+сертифікату/його CA, а не попередньому `*.express-t.ua`.
+Сертифікат чинний до **2027-10-26 13:25:40 UTC**.
+
+MQTT/AMQP та їхні `ws-*` варіанти працюють через локальні Mosquitto/RabbitMQ,
+а не як socket listeners на `18080`. Broker-и слухають loopback
+`127.0.0.1:1883` і `127.0.0.1:5672`; для віддалених клієнтів потрібен
+SSH port forwarding або окремо погоджене захищене відкриття broker endpoints.
+Використовуються raw/WebSocket routes за замовчуванням, розділені topics/queues.
+Control Plane `list_components` показує 24 socket profiles, не 4 broker subscriptions.
+Усі 28 профілів включено через transport-specific змінні `gateway.env`.
+SRT passphrase генерується при першому ввімкненні й зберігається лише
+в захищеному `gateway.env`; передавайте її клієнтам захищеним каналом.
+
+Для відтворення після встановлення `mosquitto` і `rabbitmq-server`:
+
+```sh
+./scripts/build-with-srt.sh build --locked --release \
+  -p json-rpc-gateway --bin json-rpc-gateway --features srt
+stage="$(ssh dev@192.168.1.132 'mktemp -d /tmp/jrpc-protocols.XXXXXX')"
+scp target/release/json-rpc-gateway scripts/enable-lan-gateway-protocols-node.sh \
+  /home/dev/Certs/server-fullchain.pem /home/dev/Certs/server-key.pem \
+  "dev@192.168.1.132:$stage/"
+ssh -t dev@192.168.1.132 \
+  "sudo bash '$stage/enable-lan-gateway-protocols-node.sh' '$stage'"
+```
+
+Node installer зберігає решту gateway env, налаштовує 28 профілів, додає
+постійні UFW before-rules для SCTP (132) та UDP-Lite (136) на порт `18080`
+лише з `192.168.1.0/24`, перевіряє готовність і відновлює попередній
+бінарник/env у разі timeout. Стандартні TCP/UDP LAN rules повинні вже існувати.
+Після першого встановлення RabbitMQ в `/etc/rabbitmq/rabbitmq.conf` задано
+`listeners.tcp.1 = 127.0.0.1:5672` та
+`distribution.listener.interface = 127.0.0.1`, потім сервіс перезапущено.
+Скрипт не встановлює пакети й не змінює конфігурацію broker-ів.
+
+### Запуск і зупинка встановлених сервісів
+
+Після першого розгортання запускайте на `.131`:
+
+```sh
+./scripts/start-lan-ecosystem.sh
+./scripts/stop-lan-ecosystem.sh
+```
+
+[`start-lan-ecosystem.sh`](../scripts/start-lan-ecosystem.sh) запускає встановлений backend на `.131`, потім два backend-и й gateway на `.132` та очікує готовності gateway. Він не збирає і не копіює файли, не змінює конфіги чи firewall і не перезапускає вже активні сервіси. [`stop-lan-ecosystem.sh`](../scripts/stop-lan-ecosystem.sh) зупиняє ці чотири сервіси, але зберігає їхній автозапуск після reboot. Обидва скрипти використовують `SSH_USER=dev` за замовчуванням і підтримують `SUDO_PASSWORD`; без нього потрібен `sudo -n`. Пароль не додавайте в самі скрипти чи репозиторій. Якщо запуск завершиться помилкою, вже запущені сервіси залишаться працювати для діагностики; за потреби зупиніть їх скриптом зупинки.
+
+Початковий deployment без features надає лише `echo` та `identify`. `identify` повертає ID вибраного backend-а, тож його можна використати для перевірки round-robin. Демонстраційні backend-и приймають TCP і UDP на однакових числових портах. Щоб розгорнути production застосунок, замініть demo binary та його systemd launch configuration на backend, що реалізує `GatewayBackendProtocol`. Скрипти не змінюють firewall. Якщо gateway має бути доступним лише з цієї LAN, дозвольте на `.132` TCP/UDP ingress з `192.168.1.0/24` (наприклад, `sudo ufw allow from 192.168.1.0/24 to any port 18080 proto tcp` та аналогічно `proto udp`); не відкривайте `CONTROL_PORT=18500` публічно. Backend порти `18081`/`18082` обмежте до gateway-вузла. Повторний запуск саме `deploy-lan-ecosystem.sh` оновлює бінарники/конфіги й перезапускає services.
+
+### Оновлення backend-ів із TMS та tracking
+
+Для вже встановленої LAN-екосистеми запускайте на `.131`:
+
+```sh
+TMS_MAIN_CONFIG_DIR=/home/dev/TMSBackend/tms-server-main \
+TMS_TRACKING_CONFIG_DIR=/home/dev/TMSBackend/tms-server-tracking \
+./scripts/update-lan-backends.sh
+```
+
+Скрипт збирає `gateway-demo-backend` із `--features tms,tracking`, перевіряє
+ініціалізацію обох plugins на кожному вузлі як `jsonrpc`, атомарно замінює
+бінарник і перезапускає всі три backend-и. Порти та конфігурація gateway
+не змінюються. Зберігаються `echo`/`identify`; додаються TMS-методи
+`login`, `resume`, `session.info`, `getShift`, `startShift`, `finishShift`
+та їхні `rpc.*` aliases, а також `sendLocation`/`tracking.sendLocation`.
+Перевірка готовності не є перевіркою успішного бізнесового login чи запису даних.
+
+Обидва вхідні каталоги повинні містити читабельний `.env`; наведені шляхи
+є також значеннями за замовчуванням. Файли копіюються на обидва вузли в
+`/etc/json-rpc-ecosystem/tms-main/.env` та `tms-tracking/.env` із правами
+`root:jsonrpc 0640`, каталоги — `0750`. Шляхи передаються сервісам через
+systemd drop-in `plugins.conf`, оскільки `ProtectHome=true` закриває `/home`.
+Указані в `.env` MongoDB/PostgreSQL та upstream endpoints мають бути доступні
+з обох вузлів. Скрипт не підмінює їх і не додає конфіги в Git.
+Використовуються `SSH_USER=dev`, `SUDO_PASSWORD` або `sudo -n`, як у скриптах
+запуску. Потрібні стандартні Linux-утиліти `runuser`, `timeout` та `ss`.
+
+Після встановлення plugins звичайний `deploy-lan-ecosystem.sh` відмовляється
+мовчки замінити їх demo-only збіркою. `ALLOW_DEMO_BACKEND_DOWNGRADE=1`
+дозволяє лише навмисне повернення до demo-only deployment. Для звичайного
+оновлення використовуйте `update-lan-backends.sh`, для запуску без збірки —
+`start-lan-ecosystem.sh`.
 
 ## Circuit breaker та поведінка при відмовах
+
+### Перелік методів через Control Plane
+
+Запит `{"action":"list_methods"}\n` повертає єдиний відсортований список
+імен JSON-RPC методів без дублікатів:
+
+```json
+{"success":true,"methods":["echo","identify","rpc.list_methods"],"complete":true,"errors":[]}
+```
+
+Gateway паралельно запитує **кожен** налаштований backend через
+`rpc.list_methods` із `params:{"describe":true}`, незалежно від round-robin. Використовується TCP, якщо він
+налаштований, інакше перший транспорт у відсортованій конфігурації. Запит
+не викликає бізнесові методи, не займає слоти основного пулу й не змінює
+QUIC affinity або circuit breaker. Для кожного backend-а діє timeout:
+менше з `operation_timeout_ms` і 5 секунд. Результат не кешується.
+
+Якщо хоча б один backend недоступний, не підтримує discovery чи повернув
+некоректну відповідь, повертаються `success:false`,
+`error:"MethodDiscoveryIncomplete"`, `complete:false`, доступні `methods`
+і `errors:[{"backend_id":"...","error":"DiscoveryFailed"}]`.
+Для timeout код — `DiscoveryTimeout`. Порожній список при відмові всіх
+backend-ів не є успішною відповіддю.
+
+Це **об'єднання**, не перетин методів: наявність методу в списку означає,
+що його оголосив щонайменше один backend, а не що він доступний на кожному.
+Discovery не додає маршрутизацію за методом; для неоднакових backend-ів
+звичайний round-robin і надалі може вибрати backend без потрібного методу.
+Форма `list_components` не змінюється.
+
+`RpcServer::method_names()` у JSON-RPC-2 читає реєстр handlers;
+вбудований `rpc.list_methods` повертає цей список та власне ім'я.
+`RpcServer::register_alias()` додає реальний alias у той самий реєстр.
+TMS backend реєструє також шість legacy `rpc.*` aliases, тому вони
+відображаються разом із канонічними іменами.
+
+Зміни introspection опубліковано в JSON-RPC-2, гілка `start`, commit
+`8b8ca2d`. `Cargo.lock` фіксує Git revision; локальний checkout
+`.upstream-work/JSON-RPC-2` для збірки не потрібен.
+Crates.io patches для `json-rpc-2-{core,server,transport}` спрямовані на
+той самий Git source, що й workspace dependencies, зберігаючи єдиний тип
+`RpcServer` для gateway та TMS/tracking plugins.
+Самі plugins `tms-server-main` і `tms-server-tracking` версії `0.1.0`
+залишаються залежностями локального registry: `.cargo/config.toml` очікує
+індекс `/home/dev/Crates/index` і пакети в `/home/dev/Crates`.
+
+Відповідь також містить `method_details`: схеми параметрів і готові приклади
+JSON-RPC запитів. Поле `methods` лишається масивом імен для сумісності.
+Приклад одного елемента `method_details`:
+
+```json
+{
+  "name": "resume",
+  "params_schema": {
+    "type": "object",
+    "properties": {"sessionId": {"type": "string", "minLength": 1, "pattern": "\\S"}},
+    "required": ["sessionId"]
+  },
+  "example_request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "resume",
+    "params": {"sessionId": "mock-session-id"}
+  }
+}
+```
+
+`params_schema` використовує JSON Schema: `required` перелічує обов'язкові
+поля об'єкта; інші поля `properties` необов'язкові. Вкладені об'єкти мають
+власні `required`. Tracking приймає один record або непорожній масив (`oneOf`);
+`maxItems` відповідає фактичному налаштуванню backend-а.
+Приклади містять лише вигадані значення, не конфігурацію, паролі чи токени
+користувачів. Вони показують форму запиту, але не гарантують успішної
+авторизації чи наявності сутностей; не надсилайте мокові tracking records
+у production сховище.
+
+Метадані реєструються backend-ом через `RpcServer::document_method` після
+встановлення plugins та перед створенням aliases. Rust handlers приймають
+динамічний JSON, тому бібліотека не може автоматично вивести їхні параметри.
+Для всіх методів поточного backend-а схеми й приклади задано явно.
+Незадокументований сторонній handler повертає `params_schema:null` та
+`example_request:null`, а не вигаданий порожній набір параметрів.
+Backend-и старої версії без підтримки `describe` позначаються як
+`DiscoveryFailed`; повноту discovery не підміняємо статичними даними.
+Однакові описи об'єднуються; якщо один метод має різні схеми/приклади на
+різних backend-ах, `method_details` зберігає окремі варіанти з тим самим `name`.
+`complete` і надалі означає успішне опитування всіх backend-ів, а не наявність
+документації для кожного handler-а.
+
+### Перелік компонентів через Control Plane
+
+Надішліть у TCP `CONTROL_PORT` один рядок `{"action":"list_components"}\n`.
+Для поточного LAN deployment запит можна виконати на `.132` (Control Plane
+не потрібно відкривати firewall-ом):
+
+```sh
+printf '%s\n' '{"action":"list_components"}' |
+  ssh dev@192.168.1.132 'nc -N 192.168.1.132 18500'
+```
+
+Відповідь має форму `{"success":true,"components":{"gateway":{...},"balancer":{...},"backends":[...]}}`.
+`gateway` містить `version`, `pid`, `uptime_seconds`, фактичні `listeners`
+(`transport`, `address`), `control_address` і `metrics_address`.
+`balancer` містить `version`, `execution: "in_process"` та `backend_count`.
+Кожен backend має `id`, `host`, список `transports`; кожен транспорт —
+`transport`, `port`, `pool_size`, `connected_idle_slots`, `empty_idle_slots`,
+`busy_slots` та `circuit`. Circuit: `closed` з `consecutive_failures`,
+`open` з `retry_after_ms` або `half_open` з `probe_in_flight`.
+Це локальний неатомарний знімок без активного health check: зайняті слоти
+не очікуються, а наявність connection чи закритого circuit не є доказом
+запущеного backend-процесу. Список включає всі налаштовані backend-и, навіть
+недоступні. PID/версія/uptime віддалених процесів і секретні options не повертаються.
 
 Кожен backend/transport має незалежний circuit breaker. За замовчуванням він відкривається після 5 послідовних transport/health-check помилок на 10 секунд; після cooldown дозволяється одна half-open recovery probe. У звичайному round-robin запиті відкритий endpoint пропускається на користь іншого доступного backend-а. QUIC/WS-QUIC сесії лишаються pinned до обраного backend-а. Запити автоматично не повторюються: gateway не може знати, чи backend уже встиг виконати попередній запит.
 

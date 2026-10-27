@@ -17,6 +17,11 @@ fail() {
     exit 1
 }
 
+if [[ -f /etc/systemd/system/json-rpc-backend-131.service.d/plugins.conf &&
+    "${ALLOW_DEMO_BACKEND_DOWNGRADE:-0}" != 1 ]]; then
+    fail "TMS/tracking backends are installed; use scripts/update-lan-backends.sh. Set ALLOW_DEMO_BACKEND_DOWNGRADE=1 only for an intentional demo-only downgrade."
+fi
+
 validate_port() {
     local name="$1"
     local value="$2"

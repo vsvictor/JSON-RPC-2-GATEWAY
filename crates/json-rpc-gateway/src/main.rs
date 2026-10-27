@@ -1,7 +1,9 @@
+mod components;
 mod config;
 mod control_plane;
 mod gateway;
 mod ingress;
+mod logging;
 mod session;
 
 use std::{error::Error, fs::File, io::BufReader, net::SocketAddr};
@@ -15,25 +17,22 @@ use json_rpc_balancer::BackendPool;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let started = std::time::Instant::now();
     let config = GatewayConfig::load()?;
     #[cfg(feature = "srt")]
     let srt_config = config.srt_config()?;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let udplite_config = config.udplite_config()?;
-    let filter = EnvFilter::try_new(&config.log_level)
-        .with_context(|| format!("invalid LOG_LEVEL {:?}", config.log_level))?;
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .try_init()?;
+    let (_log_guard, log_errors) = logging::init(&config.log_level)?;
 
     let metrics_address = SocketAddr::new(config.metrics_bind, config.metrics_port);
     PrometheusBuilder::new()
         .with_http_listener(metrics_address)
         .install()?;
+    let _log_metrics = logging::report_dropped_logs(log_errors);
     tracing::info!(%metrics_address, "Prometheus metrics listening");
 
     let backends = config.load_backends()?;
@@ -85,13 +84,44 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     for (kind, address) in running.listeners() {
         tracing::info!(transport = kind.id(), %address, "gateway transport listening");
     }
-    let control_task = tokio::spawn(control_plane::serve(control_listener, gateway.sessions()));
+    let inventory = std::sync::Arc::new(components::ComponentInventory::new(
+        started,
+        running
+            .listeners()
+            .map(|(kind, address)| components::ListenerInfo {
+                transport: kind.id().to_owned(),
+                address,
+            })
+            .collect(),
+        control_address,
+        metrics_address,
+        gateway.backends(),
+    ));
+    let control_task = tokio::spawn(control_plane::serve(
+        control_listener,
+        gateway.sessions(),
+        inventory,
+    ));
 
     tracing::info!(%control_address, "Control Plane listening");
-    tokio::signal::ctrl_c().await?;
+    shutdown_signal().await?;
     control_task.abort();
     running.close().await?;
     Ok(())
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 fn needs_tls_identity(kind: TransportKind) -> bool {

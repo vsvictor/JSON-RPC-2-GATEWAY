@@ -1,8 +1,10 @@
 use gateway_protocol::{decode_response, encode_request, GATEWAY_PING, GATEWAY_PONG};
 mod connector;
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -13,7 +15,7 @@ use std::{
 use anyhow::Context;
 use bytes::Bytes;
 use json_rpc_2_transport::RpcClientTransport;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::Mutex,
     time::{timeout, Instant},
@@ -96,6 +98,46 @@ pub struct BackendPool {
     backends: Vec<BackendPoolEntry>,
     strategy: Arc<dyn LoadBalancingStrategy>,
     affinity: std::sync::Mutex<HashMap<String, usize>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackendSnapshot {
+    pub id: String,
+    pub host: String,
+    pub transports: Vec<TransportSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MethodInventory {
+    pub methods: Vec<String>,
+    pub method_details: Vec<json_rpc_2_server::MethodDescription>,
+    pub complete: bool,
+    pub errors: Vec<MethodDiscoveryError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MethodDiscoveryError {
+    pub backend_id: String,
+    pub error: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransportSnapshot {
+    pub transport: String,
+    pub port: u16,
+    pub pool_size: usize,
+    pub connected_idle_slots: usize,
+    pub empty_idle_slots: usize,
+    pub busy_slots: usize,
+    pub circuit: CircuitSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CircuitSnapshot {
+    Closed { consecutive_failures: usize },
+    Open { retry_after_ms: u64 },
+    HalfOpen { probe_in_flight: bool },
 }
 
 struct BackendPoolEntry {
@@ -352,6 +394,153 @@ impl Drop for ManagedConnection {
 }
 
 impl BackendPool {
+    /// Query each backend independently without consuming round-robin or session state.
+    pub async fn list_methods(&self) -> MethodInventory {
+        let results =
+            futures_util::future::join_all(self.backends.iter().map(|backend| async move {
+                let deadline = operation_timeout(backend).min(Duration::from_secs(5));
+                let result = timeout(deadline, async {
+                    let (kind, pool) = Self::route(backend, "tcp");
+                    let connection = ManagedConnection {
+                        transport: connector::connect(&backend.config, kind, pool.port).await?,
+                        close_timeout: deadline,
+                    };
+                    let payload = Bytes::from_static(
+                    br#"{"jsonrpc":"2.0","id":"gateway-discovery","method":"rpc.list_methods","params":{"describe":true}}"#,
+                );
+                    let request = encode_request(&payload, "gateway-discovery", "tcp")?;
+                    let frame = connection
+                        .transport
+                        .send_message(request, true)
+                        .await?
+                        .context("discovery response missing")?;
+                    let payload = decode_response(frame)?
+                        .context("discovery acknowledgement has no payload")?;
+                    let response: serde_json::Value = serde_json::from_slice(&payload)?;
+                    anyhow::ensure!(
+                        response["jsonrpc"] == "2.0" && response["id"] == "gateway-discovery",
+                        "invalid discovery response envelope"
+                    );
+                    anyhow::ensure!(
+                        response.get("error").is_none(),
+                        "backend rejected discovery"
+                    );
+                    let descriptions: Vec<json_rpc_2_server::MethodDescription> =
+                        serde_json::from_value(response["result"].clone())?;
+                    anyhow::ensure!(
+                        descriptions.iter().all(|description| !description.name.is_empty()),
+                        "empty method name"
+                    );
+                    for description in &descriptions {
+                        if let Some(example) = &description.example_request {
+                            anyhow::ensure!(
+                                example["jsonrpc"] == "2.0" && example["method"] == description.name
+                                    && example.get("id").is_some()
+                                    && matches!(example.get("params"), Some(serde_json::Value::Object(_) | serde_json::Value::Array(_))),
+                                "invalid discovery example"
+                            );
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(descriptions)
+                })
+                .await;
+                (backend, result)
+            }))
+            .await;
+        let mut methods = BTreeSet::new();
+        let mut method_details = Vec::new();
+        let mut errors = Vec::new();
+        for (backend, result) in results {
+            match result {
+                Ok(Ok(descriptions)) => {
+                    for description in descriptions {
+                        methods.insert(description.name.clone());
+                        if !method_details.contains(&description) {
+                            method_details.push(description);
+                        }
+                    }
+                }
+                failure => {
+                    tracing::warn!(backend = %backend.config.id, ?failure, "backend method discovery failed");
+                    errors.push(MethodDiscoveryError {
+                        backend_id: backend.config.id.clone(),
+                        error: if failure.is_err() {
+                            "DiscoveryTimeout"
+                        } else {
+                            "DiscoveryFailed"
+                        },
+                    });
+                }
+            }
+        }
+        MethodInventory {
+            methods: methods.into_iter().collect(),
+            method_details: {
+                method_details.sort_by(|a, b| a.name.cmp(&b.name));
+                method_details
+            },
+            complete: errors.is_empty(),
+            errors,
+        }
+    }
+
+    /// A local, non-atomic snapshot; busy slots are not inspected or waited on.
+    /// Existing connections and a closed circuit do not prove backend liveness.
+    pub fn snapshot(&self) -> Vec<BackendSnapshot> {
+        self.backends
+            .iter()
+            .map(|backend| BackendSnapshot {
+                id: backend.config.id.clone(),
+                host: backend.config.host.clone(),
+                transports: backend
+                    .transports
+                    .iter()
+                    .map(|(kind, pool)| {
+                        let mut connected_idle_slots = 0;
+                        let mut empty_idle_slots = 0;
+                        let mut busy_slots = 0;
+                        for slot in &pool.slots {
+                            match slot.try_lock() {
+                                Ok(slot) if slot.connection.is_some() => connected_idle_slots += 1,
+                                Ok(_) => empty_idle_slots += 1,
+                                Err(_) => busy_slots += 1,
+                            }
+                        }
+                        let breaker = &pool.circuit_breaker;
+                        let circuit = match &*breaker.state.lock().unwrap() {
+                            CircuitState::Closed {
+                                consecutive_failures,
+                            } => CircuitSnapshot::Closed {
+                                consecutive_failures: *consecutive_failures,
+                            },
+                            CircuitState::Open { opened_at } => CircuitSnapshot::Open {
+                                retry_after_ms: breaker
+                                    .reset_timeout
+                                    .saturating_sub(opened_at.elapsed())
+                                    .as_millis()
+                                    as u64,
+                            },
+                            CircuitState::HalfOpen { probe_in_flight } => {
+                                CircuitSnapshot::HalfOpen {
+                                    probe_in_flight: *probe_in_flight,
+                                }
+                            }
+                        };
+                        TransportSnapshot {
+                            transport: kind.clone(),
+                            port: pool.port,
+                            pool_size: pool.slots.len(),
+                            connected_idle_slots,
+                            empty_idle_slots,
+                            busy_slots,
+                            circuit,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
     pub fn new(configs: Vec<BackendConfig>) -> anyhow::Result<Self> {
         Self::with_strategy(configs, Arc::new(RoundRobin::default()))
     }
@@ -763,6 +952,71 @@ mod tests {
     use super::*;
     use json_rpc_2_runtime::{MultiTransportServer, TransportKind};
     use json_rpc_2_server::RpcServer;
+
+    #[tokio::test]
+    async fn discovery_rejects_unsupported_malformed_and_timed_out_responses() {
+        struct Reply(&'static [u8], bool);
+        impl json_rpc_2_transport::JsonRpcProtocol for Reply {
+            fn handle_message<'a>(
+                &'a self,
+                _: &'a [u8],
+            ) -> json_rpc_2_transport::ProtocolFuture<'a> {
+                Box::pin(async move {
+                    if self.1 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Some(Bytes::from_static(self.0))
+                })
+            }
+        }
+        for (reply, delayed) in [
+            (
+                br#"{"jsonrpc":"2.0","id":"gateway-discovery","error":{"code":-32601}}"#.as_slice(),
+                false,
+            ),
+            (b"not json".as_slice(), false),
+            (
+                br#"{"jsonrpc":"2.0","id":"wrong","result":["echo"]}"#.as_slice(),
+                false,
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":"gateway-discovery","result":[1]}"#.as_slice(),
+                false,
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":"gateway-discovery","result":[""]}"#.as_slice(),
+                false,
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":"gateway-discovery","result":[]}"#.as_slice(),
+                true,
+            ),
+        ] {
+            let mut server = MultiTransportServer::new(Arc::new(
+                gateway_protocol::GatewayBackendProtocol::new(Arc::new(Reply(reply, delayed))),
+            ));
+            server
+                .set_bind(["127.0.0.1".parse().unwrap()])
+                .set_tcp_port(0);
+            let running = server.start().await.unwrap();
+            let mut settings = config(running.listeners().next().unwrap().1.port(), "tcp");
+            settings.options.operation_timeout_ms = if delayed { 20 } else { 1000 };
+            let pool = BackendPool::new(vec![settings]).unwrap();
+            let result = pool.list_methods().await;
+            assert!(!result.complete);
+            assert!(result.methods.is_empty());
+            assert_eq!(result.errors.len(), 1);
+            assert_eq!(
+                result.errors[0].error,
+                if delayed {
+                    "DiscoveryTimeout"
+                } else {
+                    "DiscoveryFailed"
+                }
+            );
+            running.close().await.unwrap();
+        }
+    }
     use tokio::net::TcpListener;
 
     fn config(port: u16, kind: &str) -> BackendConfig {
@@ -790,6 +1044,34 @@ mod tests {
         let mut invalid_breaker = config(1, "http1");
         invalid_breaker.options.circuit_breaker_failure_threshold = 0;
         assert!(BackendPool::new(vec![invalid_breaker]).is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_busy_slots_and_circuit_transitions_without_probing() {
+        let pool = BackendPool::new(vec![config(8081, "tcp")]).unwrap();
+        let transport = &pool.backends[0].transports["tcp"];
+        let locked = transport.slots[0].lock().await;
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot[0].transports[0].busy_slots, 1);
+        assert_eq!(snapshot[0].transports[0].empty_idle_slots, 0);
+        drop(locked);
+        let breaker = &transport.circuit_breaker;
+        *breaker.state.lock().unwrap() = CircuitState::Open {
+            opened_at: Instant::now(),
+        };
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot[0].transports[0].empty_idle_slots, 1);
+        assert!(matches!(snapshot[0].transports[0].circuit,
+            CircuitSnapshot::Open { retry_after_ms } if retry_after_ms > 0));
+        *breaker.state.lock().unwrap() = CircuitState::HalfOpen {
+            probe_in_flight: true,
+        };
+        assert!(matches!(
+            pool.snapshot()[0].transports[0].circuit,
+            CircuitSnapshot::HalfOpen {
+                probe_in_flight: true
+            }
+        ));
     }
 
     #[tokio::test]

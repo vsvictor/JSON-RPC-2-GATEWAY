@@ -1,0 +1,9 @@
+[registries.local-crates]
+index = "file:///home/dev/Crates/index"
+
+[source.local-crates]
+registry = "file:///home/dev/Crates/index"
+replace-with = "local-crate-files"
+
+[source.local-crate-files]
+directory = "/home/dev/Crates"

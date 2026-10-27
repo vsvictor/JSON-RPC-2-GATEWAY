@@ -9,10 +9,12 @@ srt = ["json-rpc-2-datagram/srt", "json-rpc-2-websockets/srt", "json-rpc-2-runti
 [dependencies]
 anyhow = "1"
 bytes = "1"
+futures-util = "0.3"
 gateway-protocol = { path = "../gateway-protocol" }
 gateway-sessions.workspace = true
 gateway-iot.workspace = true
 json-rpc-2-transport.workspace = true
+json-rpc-2-server.workspace = true
 json-rpc-2-tcp.workspace = true
 json-rpc-2-quic.workspace = true
 json-rpc-2-iot.workspace = true
@@ -29,4 +31,3 @@ tracing = "0.1"
 rcgen = "0.13"
 rustls-pki-types = "1"
 json-rpc-2-runtime.workspace = true
-json-rpc-2-server.workspace = true

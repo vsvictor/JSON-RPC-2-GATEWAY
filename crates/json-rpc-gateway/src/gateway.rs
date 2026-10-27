@@ -201,6 +201,10 @@ impl Gateway {
         Arc::clone(&self.sessions)
     }
 
+    pub fn backends(&self) -> Arc<BackendPool> {
+        Arc::clone(&self.backends)
+    }
+
     pub fn multiplexed_protocol(self: &Arc<Self>) -> Arc<dyn JsonRpcProtocol> {
         Arc::new(MultiplexedGatewayProtocol {
             protocols: TransportKind::ALL

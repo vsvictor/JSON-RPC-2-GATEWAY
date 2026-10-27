@@ -15,6 +15,19 @@ use tokio::{
 
 use super::{DispatcherLimits, Gateway};
 
+fn inventory(
+    gateway: &Gateway,
+    control: std::net::SocketAddr,
+) -> Arc<crate::components::ComponentInventory> {
+    Arc::new(crate::components::ComponentInventory::new(
+        std::time::Instant::now(),
+        Vec::new(),
+        control,
+        "127.0.0.1:9090".parse().unwrap(),
+        gateway.backends(),
+    ))
+}
+
 async fn control(stream: &mut BufReader<TcpStream>, command: Value) -> Value {
     stream
         .get_mut()
@@ -67,7 +80,7 @@ async fn http_push_is_rejected_during_request_and_registration_is_removed_after_
         let id = received.recv().await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(crate::control_plane::serve(listener, gateway.sessions()));
+        let task = tokio::spawn(crate::control_plane::serve(listener, gateway.sessions(), inventory(&gateway, address)));
         let mut plane = BufReader::new(TcpStream::connect(address).await.unwrap());
         assert_eq!(control(&mut plane, json!({"action":"register_client", "connection_id":id, "client_id":"http"})).await["success"], true);
         assert_eq!(control(&mut plane, json!({"action":"push_unicast", "client_id":"http", "payload":"forbidden"})).await,
@@ -149,7 +162,7 @@ async fn quic_migration_keeps_backend_affinity_and_control_plane_push() {
         }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let control_address = listener.local_addr().unwrap();
-        let task = tokio::spawn(crate::control_plane::serve(listener, gateway.sessions()));
+        let task = tokio::spawn(crate::control_plane::serve(listener, gateway.sessions(), inventory(&gateway, control_address)));
         let mut plane = BufReader::new(TcpStream::connect(control_address).await.unwrap());
         for (index, id) in ids.iter().enumerate() {
             assert_eq!(control(&mut plane, json!({"action":"register_client", "connection_id": id,

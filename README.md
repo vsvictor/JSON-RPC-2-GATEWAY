@@ -1,5 +1,44 @@
 # JSON-RPC gateway workspace
 
+## Optional TMS backend plugins
+
+`json-rpc-gateway` exposes independent `tms` and `tracking` Cargo features for
+the **`gateway-demo-backend` binary**, not the gateway's routing process.
+The gateway continues to balance requests normally; the selected backend
+executes the enabled methods. Existing `echo` and `identify` remain available.
+
+```sh
+cargo build -p json-rpc-gateway --bin gateway-demo-backend --features tms,tracking
+TMS_MAIN_CONFIG_DIR=/home/dev/TMSBackend/tms-server-main \
+TMS_TRACKING_CONFIG_DIR=/home/dev/TMSBackend/tms-server-tracking \
+BACKEND_BIND=127.0.0.1 BACKEND_TCP_PORT=8081 \
+./target/debug/gateway-demo-backend
+```
+
+Enable just `--features tms` for login/resume/session/shift methods, or
+`--features tracking` for `sendLocation` / `tracking.sendLocation`.
+Without these features no TMS configuration or storage is loaded.
+Each config directory must contain `.env`; nonempty process variables override
+its values. Explicit directories are recommended: the local storage exports
+do not include secret dotenv files. Without the overrides each plugin looks
+for `.env` in its own compile-time crate directory.
+The main plugin supports `QUIC_RPC_SESSION_BACKEND=memory` or Mongo;
+tracking requires its configured PostgreSQL database/schema to exist.
+Configuration/connection failures abort startup rather than silently disabling
+a plugin. Main session/rate-limit cleanup runs every 60 seconds.
+The host installs tracking before main internally, regardless of feature order.
+
+The two versioned plugin dependencies are loaded from `/home/dev/Crates` via
+the project-local `.cargo/config.toml` (`local-crates` source). No `path`
+dependencies on TMSBackend or global Cargo settings are used. Other dependencies
+retain their existing crates.io/Git sources. The workspace patches the plugins'
+registry JSON-RPC core/server/transport dependencies to the same `start` Git
+source already used by this project, ensuring a single set of protocol types.
+Provision the local storage at the same path on other build machines.
+For offline builds, the remaining ordinary/Git dependencies must already be
+cached. Building the gateway binary with these features alone does not execute
+TMS methods in the gateway; run the feature-enabled backend behind it.
+
 This workspace separates ingress/session concerns from backend selection:
 
 - `json-rpc-gateway` is the transport-facing adapter, message bus, configuration loader, and Control Plane.
@@ -61,6 +100,8 @@ Prometheus metrics are served at `http://<METRICS_BIND>:<METRICS_PORT>/metrics` 
 
 Logging policy: `ERROR` is for gateway-internal or startup failures, `WARN` for rejected requests, failed operations and recoverable backend/transport errors, `INFO` for listener/session lifecycle and circuit state transitions, `DEBUG` for complete inbound/outbound JSON-RPC, backend, push and Control Plane payloads with peer/endpoint and direction, and `TRACE` for high-frequency implementation details. DEBUG payloads are intentionally complete and can include credentials, tokens, personal data, or other secrets; enable DEBUG only with appropriate access controls, retention, and redaction at the log collection boundary. Payloads are not emitted at INFO or higher.
 
+Gateway tracing output (including balancer/library events) is written to stdout by a dedicated worker thread through a bounded 1024-record queue. Slow stdout/journald does not block RPC tasks on output I/O; formatting still happens on the emitting thread. When the queue fills, new records at any level are dropped rather than blocking. `gateway_log_records_dropped_total` reports queue losses once per second; it does not measure downstream stdout/journald delivery failures. On graceful shutdown (Ctrl+C or Unix SIGTERM, including systemd stop) the worker guard attempts a bounded drain; abrupt process termination can lose queued logs.
+
 `GATEWAY_PORT` is the fallback for TCP and UDP. Other enabled transports are selected with `GATEWAY_<TRANSPORT>_PORT` (hyphens become underscores); set these to the same value to share ingress. For WebSocket over TLS, use `GATEWAY_WS_TLS_PORT` (WSS endpoint `/ws`). Gateway-owned `GatewayIngress` groups listeners by IP-protocol/port: one physical listener owns each group, while transport contexts retain their original identifiers. Classification, ALPN policy, association selection, and the SRT relay live in `crates/json-rpc-gateway/src/ingress`, not in JSON-RPC-2. The library supplies reusable accepted-stream, accepted-connection, HTTP-router and datagram-lane APIs; standalone adapters and broker consumers reuse its ordinary runtime. MQTT and AMQP remain external broker consumers, requiring `MQTT_BROKER_URL` and `AMQP_BROKER_URL`; TLS/WSS/QUIC/HTTP3 require `TLS_CERT_PATH` and `TLS_KEY_PATH`. Unconfigured optional transports are not implicitly enabled.
 
 TCP/TLS/HTTP/WS are dispatched directly after bounded prefix detection and, where needed, TLS termination. Ordinary UDP profiles share one reader and bounded owned-packet lanes; QUIC retains ECN, destination-IP and segmentation metadata, with reserved-prefix server connection IDs for short-header dispatch. Shared QUIC disables fixed-bit greasing negotiation to keep long headers distinguishable from RTP/SRT. HTTP/3 and WS-HTTP3 share an endpoint and dispatch POST versus extended CONNECT. SCTP, DCCP and UDP-Lite have independent IP protocol namespaces and can use the same numeric port; raw and WS variants share their native listener. Classification reserves technical HTTP method prefixes, the `WSU2` application envelope and QUIC CID prefix; no business JSON is parsed.
@@ -109,6 +150,26 @@ For SRT/WS-SRT ingress, enable the `srt` feature, configure the listener port an
 Linux/Android UDP-Lite ingress accepts `GATEWAY_UDPLITE_SEND_CHECKSUM_COVERAGE` and `GATEWAY_UDPLITE_RECV_CHECKSUM_COVERAGE` in bytes (default `8`). Coverage `0` protects the entire packet; partial coverage must be at least `8`. Invalid values fail startup.
 
 ## Architecture and current upstream boundary
+
+### Component inventory (Control Plane)
+
+Send `{"action":"list_components"}` followed by `\n` to `CONTROL_PORT`.
+The response is a single JSON line with `success: true` and `components`:
+`gateway` (package version, PID, uptime in seconds, actual transport listeners,
+Control Plane and metrics addresses), `balancer` (package version,
+`execution: "in_process"`, backend count), and `backends` (configured IDs,
+hosts and transport snapshots).
+
+Each transport snapshot contains `transport`, `port`, `pool_size`,
+`connected_idle_slots`, `empty_idle_slots`, `busy_slots`, and `circuit`.
+Circuit states are `closed` with `consecutive_failures`, `open` with
+`retry_after_ms`, or `half_open` with `probe_in_flight`. A busy slot is locked
+by an exchange or maintenance; its connection is not inspected. Counts are
+a local non-atomic snapshot, not a live health probe: a configured endpoint,
+cached connection, or closed circuit does not prove a remote process is running.
+Remote PID/version/uptime and secrets are not exposed. No business payload is
+parsed, no network health check is triggered, and no pool slot is awaited.
+Control Plane remains trusted-network-only and has no authentication.
 
 The workspace uses an Adapter (`GatewayProtocol`), an asynchronous Message Bus (`IncomingEnvelope`), a Strategy (`LoadBalancingStrategy`, default `RoundRobin`), a Pool (`BackendPool`), and a Registry (`SessionRegistry`).
 
