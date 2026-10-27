@@ -1854,7 +1854,7 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-client"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#8b8ca2dde7f52d7590c087b938fb58171ad6642c"
+source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#9f3cd6c6bc3faa177ecccb839acdb15ccb0bc801"
 dependencies = [
  "bytes",
  "json-rpc-2-core",
@@ -1868,7 +1868,7 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-core"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#8b8ca2dde7f52d7590c087b938fb58171ad6642c"
+source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#9f3cd6c6bc3faa177ecccb839acdb15ccb0bc801"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -1880,7 +1880,7 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-datagram"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#8b8ca2dde7f52d7590c087b938fb58171ad6642c"
+source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#9f3cd6c6bc3faa177ecccb839acdb15ccb0bc801"
 dependencies = [
  "bytes",
  "json-rpc-2-core",
@@ -1895,7 +1895,7 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-iot"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#8b8ca2dde7f52d7590c087b938fb58171ad6642c"
+source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#9f3cd6c6bc3faa177ecccb839acdb15ccb0bc801"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1914,7 +1914,7 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-quic"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#8b8ca2dde7f52d7590c087b938fb58171ad6642c"
+source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#9f3cd6c6bc3faa177ecccb839acdb15ccb0bc801"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1936,7 +1936,7 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-runtime"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#8b8ca2dde7f52d7590c087b938fb58171ad6642c"
+source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#9f3cd6c6bc3faa177ecccb839acdb15ccb0bc801"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1966,7 +1966,7 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-server"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#8b8ca2dde7f52d7590c087b938fb58171ad6642c"
+source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#9f3cd6c6bc3faa177ecccb839acdb15ccb0bc801"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1981,7 +1981,7 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-tcp"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#8b8ca2dde7f52d7590c087b938fb58171ad6642c"
+source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#9f3cd6c6bc3faa177ecccb839acdb15ccb0bc801"
 dependencies = [
  "axum",
  "bytes",
@@ -2002,7 +2002,7 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-transport"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#8b8ca2dde7f52d7590c087b938fb58171ad6642c"
+source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#9f3cd6c6bc3faa177ecccb839acdb15ccb0bc801"
 dependencies = [
  "bytes",
  "http-body",
@@ -2020,7 +2020,7 @@ dependencies = [
 [[package]]
 name = "json-rpc-2-websockets"
 version = "0.1.0"
-source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#8b8ca2dde7f52d7590c087b938fb58171ad6642c"
+source = "git+https://github.com/vsvictor/JSON-RPC-2.git?branch=start#9f3cd6c6bc3faa177ecccb839acdb15ccb0bc801"
 dependencies = [
  "axum",
  "base64 0.22.1",

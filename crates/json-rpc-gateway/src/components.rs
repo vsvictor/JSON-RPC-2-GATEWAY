@@ -15,6 +15,7 @@ pub struct ComponentInventory {
     control_address: SocketAddr,
     metrics_address: SocketAddr,
     backends: Arc<BackendPool>,
+    pub transport_policy: Option<Arc<crate::transport_policy::TransportPolicy>>,
 }
 
 #[derive(Serialize)]
@@ -59,7 +60,16 @@ impl ComponentInventory {
             control_address,
             metrics_address,
             backends,
+            transport_policy: None,
         }
+    }
+
+    pub fn with_transport_policy(
+        mut self,
+        policy: Arc<crate::transport_policy::TransportPolicy>,
+    ) -> Self {
+        self.transport_policy = Some(policy);
+        self
     }
 
     pub fn snapshot(&self) -> Components {

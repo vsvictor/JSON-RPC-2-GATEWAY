@@ -60,6 +60,13 @@ path.chmod(0o640)
 PY
 install -o root -g root -m 0755 "$stage/json-rpc-gateway" /opt/json-rpc-ecosystem/bin/json-rpc-gateway.new
 mv -f /opt/json-rpc-ecosystem/bin/json-rpc-gateway.new /opt/json-rpc-ecosystem/bin/json-rpc-gateway
+install -d -o root -g root -m 0755 /etc/systemd/system/json-rpc-gateway.service.d
+cat >/etc/systemd/system/json-rpc-gateway.service.d/transport-state.conf <<'EOF'
+[Service]
+StateDirectory=json-rpc-gateway
+StateDirectoryMode=0750
+EOF
+systemctl daemon-reload
 systemctl restart json-rpc-gateway.service
 for ((attempt=0; attempt<60; attempt++)); do
     if python3 - <<'PY'

@@ -60,6 +60,14 @@ impl WebSocketJsonRpcAdapter {
 }
 
 impl JsonRpcProtocol for WebSocketJsonRpcAdapter {
+    fn session_cancelled<'a>(
+        &'a self,
+        context: &'a TransportContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        let context = self.context(context);
+        Box::pin(async move { self.protocol.session_cancelled(&context).await })
+    }
+
     fn handle_message<'a>(&'a self, input: &'a [u8]) -> ProtocolFuture<'a> {
         let fallback = TransportSession::stateless(self.kind);
         self.process_message(input, self.context(&fallback))
@@ -84,6 +92,9 @@ impl JsonRpcProtocol for WebSocketJsonRpcAdapter {
 
     fn session_close_requested(&self, context: &TransportContext) -> bool {
         self.close_requested(context)
+            || self
+                .protocol
+                .session_close_requested(&self.context(context))
     }
 }
 
@@ -210,6 +221,48 @@ impl WebSocketJsonRpcAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancellation_is_forwarded_to_the_selected_broker_websocket_profile() {
+        struct Policy {
+            token: tokio_util::sync::CancellationToken,
+            kinds: Mutex<Vec<String>>,
+        }
+        impl JsonRpcProtocol for Policy {
+            fn handle_message<'a>(&'a self, _: &'a [u8]) -> ProtocolFuture<'a> {
+                Box::pin(async { None })
+            }
+            fn session_close_requested(&self, _: &TransportContext) -> bool {
+                self.token.is_cancelled()
+            }
+            fn session_cancelled<'a>(
+                &'a self,
+                context: &'a TransportContext,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+                self.kinds.lock().unwrap().push(context.transport.clone());
+                Box::pin(async move { self.token.cancelled().await })
+            }
+        }
+        for kind in ["ws-mqtt", "ws-amqp"] {
+            let policy = Arc::new(Policy {
+                token: tokio_util::sync::CancellationToken::new(),
+                kinds: Mutex::new(Vec::new()),
+            });
+            let adapter = WebSocketJsonRpcAdapter::new(policy.clone(), kind);
+            let session = TransportSession::new(kind.trim_start_matches("ws-"), true);
+            adapter.session_opened(&session.context);
+            policy.token.cancel();
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                adapter.session_cancelled(&session.context),
+            )
+            .await
+            .unwrap();
+            assert_eq!(policy.kinds.lock().unwrap().as_slice(), [kind]);
+            assert!(adapter.session_close_requested(&session.context));
+            adapter.session_closed(&session.context);
+        }
+    }
 
     struct RejectRpc;
 

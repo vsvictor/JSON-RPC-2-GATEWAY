@@ -11,7 +11,9 @@ use tokio::{
 };
 
 use crate::session::SessionRegistry;
+use crate::transport_policy::TransportPolicy;
 use json_rpc_balancer::BackendPool;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -27,6 +29,7 @@ pub struct IncomingEnvelope {
     pub source_transport: TransportKind,
     pub connection_id: String,
     pub responder: oneshot::Sender<Result<Option<MessageFrame>, String>>,
+    pub admission: CancellationToken,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -67,6 +70,8 @@ pub struct Gateway {
     next_trace_id: AtomicU64,
     backends: Arc<BackendPool>,
     sessions: Arc<SessionRegistry>,
+    policy: Arc<TransportPolicy>,
+    session_generations: dashmap::DashMap<String, CancellationToken>,
 }
 
 pub struct GatewayProtocol {
@@ -89,6 +94,21 @@ impl MultiplexedGatewayProtocol {
 }
 
 impl JsonRpcProtocol for MultiplexedGatewayProtocol {
+    fn session_cancelled<'a>(
+        &'a self,
+        context: &'a TransportContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        match self.resolve(context) {
+            Some(protocol) => protocol.session_cancelled(context),
+            None => Box::pin(async {}),
+        }
+    }
+
+    fn session_close_requested(&self, context: &TransportContext) -> bool {
+        self.resolve(context)
+            .is_none_or(|protocol| protocol.session_close_requested(context))
+    }
+
     fn handle_message<'a>(&'a self, _: &'a [u8]) -> ProtocolFuture<'a> {
         tracing::error!("multiplexed ingress requires a transport context");
         Box::pin(async { None })
@@ -141,7 +161,20 @@ impl Drop for TemporarySession {
 }
 
 impl Gateway {
+    #[cfg(test)]
     pub fn new(backends: BackendPool, limits: DispatcherLimits) -> anyhow::Result<Arc<Self>> {
+        Self::with_policy(
+            backends,
+            limits,
+            TransportPolicy::new(TransportKind::ALL.iter().copied()),
+        )
+    }
+
+    pub fn with_policy(
+        backends: BackendPool,
+        limits: DispatcherLimits,
+        policy: Arc<TransportPolicy>,
+    ) -> anyhow::Result<Arc<Self>> {
         limits.validate()?;
 
         let (incoming, mut receiver) = mpsc::channel::<IncomingEnvelope>(limits.queue_capacity);
@@ -150,6 +183,8 @@ impl Gateway {
             next_trace_id: AtomicU64::new(1),
             backends: Arc::new(backends),
             sessions: SessionRegistry::new(),
+            policy,
+            session_generations: dashmap::DashMap::new(),
         });
         let backends = Arc::clone(&gateway.backends);
         backends.start_maintenance();
@@ -214,12 +249,33 @@ impl Gateway {
         })
     }
 
+    #[cfg(test)]
     async fn submit(
         &self,
         source_transport: TransportKind,
         connection_id: String,
         payload: Bytes,
     ) -> Option<Bytes> {
+        self.submit_admitted(
+            source_transport,
+            connection_id,
+            payload,
+            self.policy.generation(source_transport.id()),
+        )
+        .await
+    }
+
+    async fn submit_admitted(
+        &self,
+        source_transport: TransportKind,
+        connection_id: String,
+        payload: Bytes,
+        admission: CancellationToken,
+    ) -> Option<Bytes> {
+        if admission.is_cancelled() {
+            tracing::debug!(transport = source_transport.id(), %connection_id, "disabled transport request rejected");
+            return None;
+        }
         let trace_id = self.next_trace_id.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
             trace_id,
@@ -238,6 +294,7 @@ impl Gateway {
             source_transport,
             connection_id,
             responder,
+            admission,
         };
         match self.incoming.try_send(envelope) {
             Ok(()) => {}
@@ -322,6 +379,13 @@ impl Gateway {
 }
 
 async fn dispatch_envelope(backends: Arc<BackendPool>, envelope: IncomingEnvelope) {
+    if envelope.admission.is_cancelled() {
+        tracing::debug!(
+            trace_id = envelope.trace_id,
+            "discarding queued request from disabled transport"
+        );
+        return;
+    }
     let trace_id = envelope.trace_id;
     let transport = envelope.source_transport.id().to_owned();
     let connection_id = envelope.connection_id;
@@ -376,7 +440,38 @@ async fn dispatch_envelope(backends: Arc<BackendPool>, envelope: IncomingEnvelop
     }
 }
 
+impl GatewayProtocol {
+    fn admission(&self, context: &TransportContext) -> CancellationToken {
+        self.gateway
+            .session_generations
+            .get(&context.connection_id)
+            .map(|entry| entry.clone())
+            .unwrap_or_else(|| {
+                if context.push_sender.is_none() {
+                    self.gateway.policy.generation(self.source_transport.id())
+                } else {
+                    let token = CancellationToken::new();
+                    token.cancel();
+                    token
+                }
+            })
+    }
+}
+
 impl JsonRpcProtocol for GatewayProtocol {
+    fn session_cancelled<'a>(
+        &'a self,
+        context: &'a TransportContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        let token = self.admission(context);
+        Box::pin(async move { token.cancelled().await })
+    }
+
+    fn session_close_requested(&self, context: &TransportContext) -> bool {
+        !self.gateway.policy.enabled(self.source_transport.id())
+            || self.admission(context).is_cancelled()
+    }
+
     fn handle_owned_message<'a>(
         &'a self,
         input: Bytes,
@@ -385,6 +480,11 @@ impl JsonRpcProtocol for GatewayProtocol {
         let gateway = Arc::clone(&self.gateway);
         let transport = self.source_transport;
         let connection_id = context.connection_id.clone();
+        let admission = self.admission(context);
+        if admission.is_cancelled() {
+            tracing::debug!(transport = transport.id(), %connection_id, "disabled or retired session request rejected");
+            return Box::pin(async { None });
+        }
         let temporary = if context.push_sender.is_none()
             && gateway.sessions.register_temporary_session(context)
         {
@@ -398,7 +498,7 @@ impl JsonRpcProtocol for GatewayProtocol {
         Box::pin(async move {
             let _session = temporary;
             gateway
-                .submit(transport, connection_id, input)
+                .submit_admitted(transport, connection_id, input, admission)
                 .await
                 .map(json_rpc_2_transport::TransportMessage::from)
         })
@@ -408,7 +508,15 @@ impl JsonRpcProtocol for GatewayProtocol {
         let gateway = Arc::clone(&self.gateway);
         let transport = self.source_transport;
         let payload = Bytes::copy_from_slice(input);
+        let admission = gateway.policy.generation(transport.id());
         Box::pin(async move {
+            if admission.is_cancelled() {
+                tracing::debug!(
+                    transport = transport.id(),
+                    "disabled transport request rejected"
+                );
+                return None;
+            }
             let context = TransportSession::stateless(transport.id());
             gateway.sessions.register_session(&context);
             let connection_id = context.connection_id.clone();
@@ -416,7 +524,9 @@ impl JsonRpcProtocol for GatewayProtocol {
                 sessions: Arc::clone(&gateway.sessions),
                 connection_id: connection_id.clone(),
             };
-            gateway.submit(transport, connection_id, payload).await
+            gateway
+                .submit_admitted(transport, connection_id, payload, admission)
+                .await
         })
     }
 
@@ -429,10 +539,22 @@ impl JsonRpcProtocol for GatewayProtocol {
         let transport = self.source_transport;
         let connection_id = context.connection_id.clone();
         let payload = Bytes::copy_from_slice(input);
-        Box::pin(async move { gateway.submit(transport, connection_id, payload).await })
+        let admission = self.admission(context);
+        Box::pin(async move {
+            gateway
+                .submit_admitted(transport, connection_id, payload, admission)
+                .await
+        })
     }
 
     fn session_opened(&self, context: &TransportContext) {
+        let token = self.gateway.policy.generation(self.source_transport.id());
+        self.gateway
+            .session_generations
+            .insert(context.connection_id.clone(), token.clone());
+        if token.is_cancelled() {
+            return;
+        }
         if let Err(error) = self
             .gateway
             .backends
@@ -445,6 +567,9 @@ impl JsonRpcProtocol for GatewayProtocol {
     }
 
     fn session_closed(&self, context: &TransportContext) {
+        self.gateway
+            .session_generations
+            .remove(&context.connection_id);
         self.gateway.sessions.remove_session(&context.connection_id);
         self.gateway.backends.close_session(&context.connection_id);
     }

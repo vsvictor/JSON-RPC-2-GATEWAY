@@ -20,6 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 mod amqp;
 #[cfg(feature = "mqtt")]
 mod mqtt;
+#[cfg(test)]
+mod tests;
 
 /// MQTT 3.1.1 broker settings. URLs support credentials and `mqtts://` TLS.
 /// Debug deliberately omits URLs, which may contain passwords.
@@ -200,6 +202,8 @@ pub(crate) struct Message {
     pub ack: Option<lapin::Acker>,
 }
 enum Session {
+    #[cfg(test)]
+    Test(mpsc::UnboundedSender<(String, Bytes, Metadata)>),
     #[cfg(feature = "mqtt")]
     Mqtt(mqtt::Session),
     #[cfg(feature = "amqp")]
@@ -216,6 +220,10 @@ impl Session {
         metadata: Metadata,
     ) -> Result<(), TransportError> {
         match self {
+            #[cfg(test)]
+            Self::Test(events) => events
+                .send((destination.to_owned(), payload, metadata))
+                .map_err(|_| TransportError::new("test broker closed")),
             #[cfg(feature = "mqtt")]
             Self::Mqtt(s) => {
                 s.publish(
@@ -244,6 +252,8 @@ impl Session {
     }
     async fn close(&self) -> Result<(), TransportError> {
         match self {
+            #[cfg(test)]
+            Self::Test(_) => Ok(()),
             #[cfg(feature = "mqtt")]
             Self::Mqtt(s) => s.close().await,
             #[cfg(feature = "amqp")]
@@ -267,6 +277,7 @@ fn ingress_session(
     protocol: Arc<dyn json_rpc_2_transport::JsonRpcProtocol>,
     session: Arc<Session>,
     identity: &SessionIdentity,
+    closed: mpsc::UnboundedSender<SessionIdentity>,
 ) -> IngressSession {
     let transport = match config {
         #[cfg(feature = "mqtt")]
@@ -275,12 +286,24 @@ fn ingress_session(
         Config::Amqp(_) => "amqp",
     };
     let mut ingress = json_rpc_2_transport::TransportSession::new(transport, true);
-    let guard = json_rpc_2_transport::ProtocolSessionGuard::new(protocol, ingress.context);
+    let context = ingress.context.clone();
+    let guard = json_rpc_2_transport::ProtocolSessionGuard::new(protocol.clone(), ingress.context);
+    let identity = identity.clone();
     let push_to = identity.push_to.clone();
     let destination = push_to.clone();
     let config = config.clone();
     let push = tokio::spawn(async move {
-        while let Some(payload) = ingress.push_receiver.recv().await {
+        loop {
+            let payload = tokio::select! {
+                biased;
+                _ = protocol.session_cancelled(&context) => {
+                    if closed.send(identity.clone()).is_err() {
+                        json_rpc_2_transport::log_transport_error("broker", "external", "close session", &"ingress is closed");
+                    }
+                    return;
+                },
+                payload = ingress.push_receiver.recv() => match payload { Some(payload) => payload, None => return },
+            };
             if payload.len() > config.max_payload() {
                 break;
             }
@@ -306,6 +329,27 @@ fn ingress_session(
         }
     });
     IngressSession { guard, push }
+}
+
+async fn publish_session_close(config: &Config, session: &Session, identity: &SessionIdentity) {
+    if let Err(error) = bounded(
+        config.operation_timeout(),
+        session.publish(
+            &identity.push_to,
+            Bytes::new(),
+            None,
+            String::new(),
+            false,
+            Metadata {
+                session: None,
+                kind: MessageKind::Close,
+            },
+        ),
+    )
+    .await
+    {
+        json_rpc_2_transport::log_transport_error("broker", "external", "close session", &error);
+    }
 }
 
 pub(crate) struct Prepared {
@@ -350,6 +394,14 @@ pub(crate) async fn serve(
             }
         };
         let session = Arc::new(session);
+        let (closed, mut closing) = mpsc::unbounded_channel();
+        let kind = match &config {
+            #[cfg(feature = "mqtt")]
+            Config::Mqtt(_) => "mqtt",
+            #[cfg(feature = "amqp")]
+            Config::Amqp(_) => "amqp",
+        };
+        let admission_context = json_rpc_2_transport::TransportSession::stateless(kind);
         let policy = config.sessions();
         let mut sessions =
             SessionRuntime::<IngressSession>::new(policy, runtime.limits.max_connections.max(1))
@@ -362,7 +414,13 @@ pub(crate) async fn serve(
             .max(1);
         loop {
             let message = tokio::select! {
+                biased;
                 _ = shutdown.cancelled() => break,
+                Some(identity) = closing.recv() => {
+                    drop(sessions.close_identity(&identity, Instant::now()));
+                    publish_session_close(&config, &session, &identity).await;
+                    continue;
+                },
                 _ = leases.tick() => {
                     drop(sessions.expire(Instant::now()));
                     drop(sessions.remove_failed(Instant::now(), |session| session.push.is_finished()));
@@ -376,12 +434,43 @@ pub(crate) async fn serve(
                 },
                 message = incoming.recv() => match message { Some(m) => m, None => break },
             };
+            if protocol.session_close_requested(&admission_context) {
+                if let Some(identity) = &message.metadata.session {
+                    publish_session_close(&config, &session, identity).await;
+                }
+                #[cfg(feature = "amqp")]
+                if let Some(ack) = message.ack
+                    && let Err(error) = bounded(config.operation_timeout(), async {
+                        ack.nack(lapin::options::BasicNackOptions {
+                            requeue: false,
+                            multiple: false,
+                        })
+                        .await
+                        .map_err(|_| TransportError::new("AMQP acknowledgement failed"))
+                    })
+                    .await
+                {
+                    json_rpc_2_transport::log_transport_error(
+                        "AMQP",
+                        "external",
+                        "reject disabled transport",
+                        &error,
+                    );
+                }
+                continue;
+            }
             let mut context = None;
             let active_request = match sessions.dispatch(
                 &message.metadata,
                 Instant::now(),
                 |identity: &SessionIdentity| {
-                    ingress_session(&config, protocol.clone(), session.clone(), identity)
+                    ingress_session(
+                        &config,
+                        protocol.clone(),
+                        session.clone(),
+                        identity,
+                        closed.clone(),
+                    )
                 },
             ) {
                 SessionDispatch::Rpc { identity, request } => {
@@ -444,10 +533,23 @@ pub(crate) async fn serve(
             let session = session.clone();
             let protocol = protocol.clone();
             let config = config.clone();
+            let context =
+                context.unwrap_or_else(|| json_rpc_2_transport::TransportSession::stateless(kind));
+            let temporary = context.push_sender.is_none().then(|| {
+                json_rpc_2_transport::ProtocolSessionGuard::new(protocol.clone(), context.clone())
+            });
             workers.spawn(async move {
                 let _activity = activity;
+                let _temporary = temporary;
                 let mut close_session = false;
-                let result = bounded(config.response_timeout(), async {
+                let cancellation_context = context.clone();
+                let result = tokio::select! {
+                    biased;
+                    _ = protocol.session_cancelled(&cancellation_context) => {
+                        close_session = true;
+                        Err(TransportError::new("broker transport disabled"))
+                    },
+                    result = bounded(config.response_timeout(), async {
                     let transport = match &config {
                         #[cfg(feature = "mqtt")]
                         Config::Mqtt(_) => "MQTT",
@@ -459,11 +561,6 @@ pub(crate) async fn serve(
                         json_rpc_2_transport::log_control(transport, "external", "ping", "pong");
                         Some(Bytes::from_static(b"pong"))
                     } else {
-                        let context = context.unwrap_or_else(|| {
-                            json_rpc_2_transport::TransportSession::stateless(
-                                transport.to_ascii_lowercase(),
-                            )
-                        });
                         let response = protocol
                             .handle_owned_message(message.payload.clone(), &context)
                             .await
@@ -515,8 +612,8 @@ pub(crate) async fn serve(
                         .await?;
                     }
                     Ok(())
-                })
-                .await;
+                }) => result,
+                };
                 #[cfg(feature = "amqp")]
                 if let Some(ack) = message.ack {
                     let acknowledged = bounded(config.operation_timeout(), async {

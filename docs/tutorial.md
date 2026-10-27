@@ -636,6 +636,58 @@ Backend-и старої версії без підтримки `describe` поз
 `complete` і надалі означає успішне опитування всіх backend-ів, а не наявність
 документації для кожного handler-а.
 
+### Гаряче керування транспортами
+
+Control Plane дозволяє незалежно вимикати й знову вмикати налаштовані
+профілі без рестарту gateway:
+
+```json
+{"action":"list_transports"}
+{"action":"set_transport_enabled","transport":"quic","enabled":false}
+{"action":"set_transport_enabled","transport":"quic","enabled":true}
+```
+
+Кожна команда займає окремий рядок TCP Control Plane, як і `list_methods`.
+Успішна відповідь містить `success:true` та `transports` — відсортований
+масив об'єктів `{"transport":"quic","enabled":false}`. Ідентифікатори
+збігаються з ingress (`tcp`, `tls`, `udp`, `http1`, `http3`, `ws-quic`
+тощо); raw та `ws-*` перемикаються окремо, включно з MQTT/AMQP.
+Можна ввімкнути лише профілі, вже налаштовані через `GATEWAY_*_PORT`
+і доступні у збірці. Невідомий або неналаштований профіль повертає
+`success:false,error:"TransportNotConfigured"`, а не створює новий listener.
+
+Заборона скасовує активні сесії вибраного профілю, зокрема idle-з'єднання,
+прибирає їхні client/group registrations та QUIC backend affinity і
+відхиляє нові запити. Повторне ввімкнення допускає нові сесії, але не
+відновлює старі. Спільні сокети залишаються прив'язаними: TCP/TLS/QUIC
+handshake на спільному порту сам по собі не означає дозволений RPC.
+HTTP-профілі відмовляють HTTP 503 або закривають з'єднання; datagram-профілі
+відкидають пакети та очищають власні reliability caches. Інші протоколи на
+тому самому порту не перезапускаються. На спільному HTTP/3 connection
+скасовуються лише відповідні request/WebSocket streams: сам QUIC connection
+може залишатися відкритим для іншого дозволеного HTTP/3 профілю.
+MQTT/AMQP надсилають клієнтам session `close`, зберігаючи broker subscription
+для повторного ввімкнення. Вже передані backend-у бізнес-операції можуть
+завершитися; заборона транспорту не є rollback або дозволом повторити RPC.
+
+Стан зберігається атомарною заміною JSON-файлу **до** застосування команди.
+Типовий шлях — `/var/lib/json-rpc-gateway/transports.json`; його можна змінити
+через `GATEWAY_TRANSPORT_STATE_PATH`. Помилка запису повертає
+`TransportPolicyPersistenceFailed` і не змінює поточну політику.
+Пошкоджений файл, невідома версія або профіль, недоступний у поточній збірці,
+зупиняють запуск з помилкою; немає непомітного скидання заборон.
+Тимчасово прибрані з ingress конфігурації заборони зберігаються у файлі.
+`list_components` і далі показує прив'язані socket profiles; фактичний дозвіл
+потрібно читати через `list_transports`.
+
+LAN deployment створює writable systemd `StateDirectory=json-rpc-gateway`
+із mode `0750`, сумісний із `ProtectSystem=strict`. Для ручного запуску
+підготуйте writable каталог і задайте, наприклад,
+`GATEWAY_TRANSPORT_STATE_PATH="$PWD/var/transports.json"`; каталог `var`
+потрібно створити заздалегідь. Для наявного systemd unit потрібен такий самий
+`StateDirectory` drop-in і `systemctl daemon-reload`; скрипт увімкнення
+LAN-протоколів встановлює його автоматично.
+
 ### Перелік компонентів через Control Plane
 
 Надішліть у TCP `CONTROL_PORT` один рядок `{"action":"list_components"}\n`.

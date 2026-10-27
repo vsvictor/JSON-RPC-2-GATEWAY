@@ -382,7 +382,7 @@ where
                     "HTTP is not enabled on this shared listener",
                 ));
             };
-            serve_http(replay, peer, secure, router, shutdown).await
+            serve_http(replay, peer, secure, router, protocol, shutdown).await
         }
         Classification::HttpPost if http_allowed(&kinds, secure, false) => {
             let Some(router) = http_router else {
@@ -391,7 +391,7 @@ where
                     "HTTP is not enabled on this shared listener",
                 ));
             };
-            serve_http(replay, peer, secure, router, shutdown).await
+            serve_http(replay, peer, secure, router, protocol, shutdown).await
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -405,13 +405,29 @@ async fn serve_http<S>(
     peer: std::net::SocketAddr,
     secure: bool,
     router: EmbeddedRouter,
+    protocol: Arc<dyn JsonRpcProtocol>,
     shutdown: CancellationToken,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let (profile, selected) = tokio::sync::watch::channel(None);
+    let cancellation_protocol = protocol.clone();
     let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
         let router = router.clone();
+        let protocol = protocol.clone();
+        let websocket = request
+            .headers()
+            .get(hyper::header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
+        let kind = match (secure, websocket) {
+            (true, true) => "ws-tls",
+            (true, false) => "tls",
+            (false, true) => "ws-http1",
+            (false, false) => "http1",
+        };
+        let context = json_rpc_2_transport::TransportSession::stateless(kind);
+        profile.send_replace(Some(context.clone()));
         request
             .extensions_mut()
             .insert(axum::extract::ConnectInfo(peer));
@@ -420,7 +436,17 @@ where
                 .extensions_mut()
                 .insert(json_rpc_2_tcp::server::transports::http1::TlsIngress);
         }
-        async move { router.oneshot(request.map(axum::body::Body::new)).await }
+        async move {
+            if protocol.session_close_requested(&context) {
+                return Ok::<_, std::convert::Infallible>(
+                    axum::response::Response::builder()
+                        .status(hyper::StatusCode::SERVICE_UNAVAILABLE)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                );
+            }
+            router.oneshot(request.map(axum::body::Body::new)).await
+        }
     });
     let service = TowerToHyperService::new(service);
     let connection = hyper::server::conn::http1::Builder::new()
@@ -428,11 +454,34 @@ where
         .with_upgrades();
     tokio::pin!(connection);
     tokio::select! {
+        biased;
+        _ = http_profile_cancelled(cancellation_protocol, selected) => Ok(()),
         _ = shutdown.cancelled() => {
             connection.as_mut().graceful_shutdown();
             connection.await.map_err(|error| io::Error::other(error.to_string()))
         }
         result = &mut connection => result.map_err(|error| io::Error::other(error.to_string())),
+    }
+}
+
+async fn http_profile_cancelled(
+    protocol: Arc<dyn JsonRpcProtocol>,
+    mut selected: tokio::sync::watch::Receiver<Option<json_rpc_2_transport::TransportContext>>,
+) {
+    loop {
+        let context = selected.borrow_and_update().clone();
+        match context {
+            Some(context) => tokio::select! {
+                biased;
+                _ = protocol.session_cancelled(&context) => return,
+                result = selected.changed() => if result.is_err() { return },
+            },
+            None => {
+                if selected.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 

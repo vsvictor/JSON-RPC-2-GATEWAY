@@ -5,6 +5,7 @@ mod gateway;
 mod ingress;
 mod logging;
 mod session;
+mod transport_policy;
 
 use std::{error::Error, fs::File, io::BufReader, net::SocketAddr};
 
@@ -38,7 +39,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let backends = config.load_backends()?;
     let pool = BackendPool::new(backends)?;
     pool.warm_up().await?;
-    let gateway = Gateway::new(pool, config.dispatcher_limits)?;
+    let policy = transport_policy::TransportPolicy::load(
+        config.transport_ports.keys().copied(),
+        std::env::var_os("GATEWAY_TRANSPORT_STATE_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/var/lib/json-rpc-gateway/transports.json".into()),
+    )?;
+    let gateway = Gateway::with_policy(pool, config.dispatcher_limits, policy.clone())?;
     let control_address = SocketAddr::new(config.bind, config.control_port);
     let control_listener = TcpListener::bind(control_address)
         .await
@@ -84,19 +91,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     for (kind, address) in running.listeners() {
         tracing::info!(transport = kind.id(), %address, "gateway transport listening");
     }
-    let inventory = std::sync::Arc::new(components::ComponentInventory::new(
-        started,
-        running
-            .listeners()
-            .map(|(kind, address)| components::ListenerInfo {
-                transport: kind.id().to_owned(),
-                address,
-            })
-            .collect(),
-        control_address,
-        metrics_address,
-        gateway.backends(),
-    ));
+    let inventory = std::sync::Arc::new(
+        components::ComponentInventory::new(
+            started,
+            running
+                .listeners()
+                .map(|(kind, address)| components::ListenerInfo {
+                    transport: kind.id().to_owned(),
+                    address,
+                })
+                .collect(),
+            control_address,
+            metrics_address,
+            gateway.backends(),
+        )
+        .with_transport_policy(policy),
+    );
     let control_task = tokio::spawn(control_plane::serve(
         control_listener,
         gateway.sessions(),

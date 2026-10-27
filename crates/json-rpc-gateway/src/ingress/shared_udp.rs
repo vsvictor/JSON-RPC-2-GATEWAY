@@ -13,6 +13,7 @@ use tokio::{net::UdpSocket, sync::mpsc};
 use json_rpc_2_runtime::TransportKind;
 
 pub(crate) struct Router {
+    pub protocol: Arc<dyn json_rpc_2_transport::JsonRpcProtocol>,
     pub socket: Arc<UdpSocket>,
     pub lanes: Vec<(TransportKind, mpsc::Sender<OwnedDatagram>)>,
 
@@ -78,7 +79,11 @@ impl Router {
                     .flatten()
             });
         match lane {
-            Some((_, sender)) => {
+            Some((kind, sender)) => {
+                let context = json_rpc_2_transport::TransportSession::stateless(kind.id());
+                if self.protocol.session_close_requested(&context) {
+                    return;
+                }
                 if let Err(error) = sender.try_send((packet, peer)) {
                     log_transport_error("shared UDP", peer, "packet queue", &error);
                 }
@@ -240,11 +245,21 @@ pub(crate) mod quic {
 
         #[tokio::test]
         async fn bounded_lanes_route_owned_packets_without_copying_or_blocking() {
+            struct Protocol;
+            impl json_rpc_2_transport::JsonRpcProtocol for Protocol {
+                fn handle_message<'a>(
+                    &'a self,
+                    _: &'a [u8],
+                ) -> json_rpc_2_transport::ProtocolFuture<'a> {
+                    Box::pin(async { None })
+                }
+            }
             let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
             let peer = socket.local_addr().unwrap();
             let (raw, mut raw_rx) = mpsc::channel(1);
             let (ws, mut ws_rx) = mpsc::channel(1);
             let router = Router {
+                protocol: Arc::new(Protocol),
                 socket,
                 lanes: vec![(TransportKind::Udp, raw), (TransportKind::WebSocketUdp, ws)],
 

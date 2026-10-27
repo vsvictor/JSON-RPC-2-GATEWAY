@@ -227,7 +227,12 @@ impl GatewayIngress {
             iot: None,
         };
         for kinds in groups {
-            if kinds.len() == 1 && !is_iot_datagram(kinds[0]) {
+            if kinds.len() == 1
+                && !matches!(
+                    kinds[0].socket(),
+                    TransportSocket::Tcp | TransportSocket::Udp | TransportSocket::UdpLite
+                )
+            {
                 self.standalone.set_port(kinds[0], self.ports[&kinds[0]]);
                 continue;
             }
@@ -472,6 +477,7 @@ impl GatewayIngress {
             transport: RunningTransport::spawn(move |shutdown| {
                 Box::pin(async move {
                     let router = crate::ingress::shared_udp::Router {
+                        protocol: protocol.clone(),
                         socket,
                         lanes,
 
@@ -486,6 +492,26 @@ impl GatewayIngress {
                         Arc::new(JsonRpcWebSocket::new(protocol.clone()));
                     #[allow(unreachable_code, unreachable_patterns, unused_variables)]
                     for (kind, source) in receivers {
+                        let protocol = protocol.clone();
+                        let websocket = websocket.clone();
+                        let runtime = runtime.clone();
+                        children.push(RunningTransport::spawn(move |stop| Box::pin(async move {
+                            let context = json_rpc_2_transport::TransportSession::stateless(kind.id());
+                            let mut reset = false;
+                            loop {
+                                while protocol.session_close_requested(&context) {
+                                    tokio::select! {
+                                        _ = stop.cancelled() => return Ok(()),
+                                        _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {},
+                                    }
+                                }
+                                let disabled = protocol.session_cancelled(&context);
+                                tokio::pin!(disabled);
+                                if reset {
+                                    source.discard_pending().await;
+                                }
+                                reset = true;
+                                let source = source.clone();
                         let child = match kind {
                             TransportKind::Udp => UdpTransport::new(source)
                                 .with_runtime(runtime.clone())
@@ -530,7 +556,15 @@ impl GatewayIngress {
                             }
                             _ => unreachable!("only datagram lane kinds create receivers"),
                         };
-                        children.push(child);
+                                let stopping = tokio::select! {
+                                    biased;
+                                    _ = stop.cancelled() => true,
+                                    _ = &mut disabled => false,
+                                };
+                                child.abort().await?;
+                                if stopping { return Ok(()) }
+                            }
+                        })));
                     }
 
                     if let Some(endpoint) = endpoint {
@@ -688,9 +722,6 @@ impl RunningIngress {
     }
 }
 
-fn is_iot_datagram(kind: TransportKind) -> bool {
-    matches!(kind.id(), "coap" | "ws-coap")
-}
 /// A socket bound to `address`. An IPv6 socket accepts IPv6 only
 /// (`IPV6_V6ONLY`), so `0.0.0.0` and `::` can be bound side by side on every OS.
 fn bind_socket(

@@ -118,6 +118,10 @@ async fn serve_http3(
     let peer = connection.remote_address();
     let raw = kinds.iter().any(|kind| kind.id() == "http3");
     let websocket = kinds.iter().any(|kind| kind.id() == "ws-http3");
+    let context =
+        json_rpc_2_transport::TransportSession::stateless(if raw { "http3" } else { "ws-http3" });
+    let disabled = protocol.session_cancelled(&context);
+    tokio::pin!(disabled);
     let mut builder = h3::server::builder();
     builder.enable_extended_connect(websocket);
     let setup = tokio::select! {
@@ -142,6 +146,8 @@ async fn serve_http3(
     let requests = multiplexor.handle();
     loop {
         let resolver = tokio::select! {
+            biased;
+            _ = &mut disabled, if raw != websocket => break,
             _ = shutdown.cancelled() => {
                 if let Err(error) = h3.shutdown(0).await {
                     log_transport_error("shared HTTP/3", peer, "GOAWAY", &error);
@@ -167,6 +173,28 @@ async fn serve_http3(
                 let result = async {
                     use json_rpc_2_websockets::server::transports::http3::handle_resolved_request;
                     let (request, mut stream) = resolver.resolve_request().await?;
+                    let kind = if request.method() == http::Method::CONNECT {
+                        "ws-http3"
+                    } else {
+                        "http3"
+                    };
+                    let context = json_rpc_2_transport::TransportSession::stateless(kind);
+                    if protocol.session_close_requested(&context) {
+                        stream
+                            .send_response(
+                                http::Response::builder()
+                                    .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                                    .body(())?,
+                            )
+                            .await?;
+                        stream.finish().await?;
+                        return Ok(());
+                    }
+                    let cancellation_protocol = protocol.clone();
+                    tokio::select! {
+                        biased;
+                        _ = cancellation_protocol.session_cancelled(&context) => Ok(()),
+                        result = async move {
                     if websocket && request.method() == http::Method::CONNECT {
                         let websocket = Arc::new(
                             json_rpc_2_websockets::server::transports::JsonRpcWebSocket::new(
@@ -193,6 +221,8 @@ async fn serve_http3(
                             .await?;
                         stream.finish().await?;
                         Ok(())
+                    }
+                        } => result,
                     }
                 }
                 .await;

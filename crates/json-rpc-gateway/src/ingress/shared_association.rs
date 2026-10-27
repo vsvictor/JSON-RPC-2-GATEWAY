@@ -24,6 +24,7 @@ pub(crate) fn protocol_adapter(
         raw,
         websocket,
         sessions: Mutex::new(HashMap::new()),
+        changed: tokio::sync::Notify::new(),
     })
 }
 
@@ -31,6 +32,7 @@ struct SharedAssociationProtocol {
     raw: Option<Arc<dyn JsonRpcProtocol>>,
     websocket: Option<Arc<dyn JsonRpcProtocol>>,
     sessions: Mutex<HashMap<String, Association>>,
+    changed: tokio::sync::Notify,
 }
 
 struct Association {
@@ -77,6 +79,7 @@ impl SharedAssociationProtocol {
                     Selection::Rejected
                 }
             };
+            self.changed.notify_waiters();
         }
         match &session.selection {
             Selection::Selected(protocol) => Some((protocol.clone(), session.context.clone())),
@@ -86,6 +89,38 @@ impl SharedAssociationProtocol {
 }
 
 impl JsonRpcProtocol for SharedAssociationProtocol {
+    fn session_cancelled<'a>(
+        &'a self,
+        context: &'a TransportContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let selected = {
+                    let sessions = self.sessions.lock().unwrap();
+                    match sessions.get(&context.connection_id) {
+                        Some(Association {
+                            context,
+                            selection: Selection::Selected(protocol),
+                        }) => Some((protocol.clone(), context.clone())),
+                        Some(Association {
+                            selection: Selection::Pending,
+                            ..
+                        }) => None,
+                        _ => return,
+                    }
+                };
+                if let Some((protocol, context)) = selected {
+                    protocol.session_cancelled(&context).await;
+                    return;
+                }
+                changed.await;
+            }
+        })
+    }
+
     fn handle_message<'a>(&'a self, input: &'a [u8]) -> ProtocolFuture<'a> {
         Box::pin(async move {
             let protocol = if input.starts_with(b"WSU2") {

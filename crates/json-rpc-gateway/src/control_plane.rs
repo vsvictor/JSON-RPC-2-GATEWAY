@@ -19,6 +19,11 @@ const MAX_CONTROL_LINE_BYTES: usize = 64 * 1024;
 enum ControlCommand {
     ListComponents,
     ListMethods,
+    ListTransports,
+    SetTransportEnabled {
+        transport: String,
+        enabled: bool,
+    },
     RegisterClient {
         connection_id: String,
         client_id: String,
@@ -55,6 +60,8 @@ struct ControlResponse {
     complete: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     errors: Option<Vec<json_rpc_balancer::MethodDiscoveryError>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transports: Option<Vec<crate::transport_policy::TransportStatus>>,
 }
 
 impl ControlResponse {
@@ -68,6 +75,7 @@ impl ControlResponse {
             method_details: None,
             complete: None,
             errors: None,
+            transports: None,
         }
     }
 
@@ -81,6 +89,7 @@ impl ControlResponse {
             method_details: None,
             complete: None,
             errors: None,
+            transports: None,
         }
     }
 }
@@ -154,6 +163,23 @@ async fn process_command(
     sessions: &SessionRegistry,
     inventory: &ComponentInventory,
 ) -> ControlResponse {
+    if matches!(
+        command,
+        ControlCommand::ListTransports | ControlCommand::SetTransportEnabled { .. }
+    ) {
+        let Some(policy) = &inventory.transport_policy else {
+            return ControlResponse::failure("TransportPolicyUnavailable");
+        };
+        if let ControlCommand::SetTransportEnabled { transport, enabled } = command
+            && let Err(error) = policy.set_enabled(&transport, enabled).await
+        {
+            tracing::warn!(%transport, enabled, %error, "transport policy command rejected");
+            return ControlResponse::failure(error);
+        }
+        let mut response = ControlResponse::success(None);
+        response.transports = Some(policy.snapshot());
+        return response;
+    }
     if matches!(command, ControlCommand::ListMethods) {
         let result = inventory.list_methods().await;
         let mut response = if result.complete {
@@ -178,14 +204,20 @@ async fn process_command(
 
 fn process_session_command(command: ControlCommand, sessions: &SessionRegistry) -> ControlResponse {
     let action = match &command {
-        ControlCommand::ListComponents | ControlCommand::ListMethods => unreachable!(),
+        ControlCommand::ListComponents
+        | ControlCommand::ListMethods
+        | ControlCommand::ListTransports
+        | ControlCommand::SetTransportEnabled { .. } => unreachable!(),
         ControlCommand::RegisterClient { .. } => "register_client",
         ControlCommand::PushUnicast { .. } => "push_unicast",
         ControlCommand::PushMulticast { .. } => "push_multicast",
         ControlCommand::PushBroadcast { .. } => "push_broadcast",
     };
     let result = match command {
-        ControlCommand::ListComponents | ControlCommand::ListMethods => unreachable!(),
+        ControlCommand::ListComponents
+        | ControlCommand::ListMethods
+        | ControlCommand::ListTransports
+        | ControlCommand::SetTransportEnabled { .. } => unreachable!(),
         ControlCommand::RegisterClient {
             connection_id,
             client_id,
