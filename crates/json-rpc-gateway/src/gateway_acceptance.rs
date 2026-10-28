@@ -16,6 +16,114 @@ use tokio::{
 use super::{DispatcherLimits, Gateway};
 
 #[tokio::test]
+async fn hot_backends_control_plane_updates_routing_discovery_and_closes_pinned_sessions() {
+    use crate::transport_policy::tests::StateFile;
+    use json_rpc_2_transport::WS_QUIC_ALPN;
+    use json_rpc_2_websockets::client::transports::quic::QuicWebSocketClientTransport;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut servers = Vec::new();
+        let mut configs = Vec::new();
+        for id in ["a", "b"] {
+            let rpc = Arc::new(RpcServer::new());
+            rpc.register("identify", move |_| async move { Ok(json!(id)) }).unwrap();
+            rpc.register(id, |_| async { Ok(Value::Null) }).unwrap();
+            let running = MultiTransportServer::new(Arc::new(
+                gateway_protocol::GatewayBackendProtocol::new(rpc)
+            )).set_bind(["127.0.0.1".parse().unwrap()]).set_tcp_port(0).start().await.unwrap();
+            configs.push(BackendConfig {
+                id: id.into(), host: "127.0.0.1".into(),
+                ports: [("tcp".into(), running.listeners().next().unwrap().1.port())].into_iter().collect(),
+                pool_size: 1, options: Default::default(),
+            });
+            servers.push(running);
+        }
+        let file = StateFile::new();
+        let pool = BackendPool::load(vec![configs[0].clone()], file.0.clone()).unwrap();
+        pool.warm_up().await.unwrap();
+        let gateway = Gateway::new(pool, DispatcherLimits::default()).unwrap();
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert: rustls::pki_types::CertificateDer<'static> = identity.cert.into();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(identity.key_pair.serialize_der().into());
+        let mut ingress = crate::ingress::GatewayIngress::new(gateway.multiplexed_protocol());
+        ingress.set_bind(["127.0.0.1".parse().unwrap()])
+            .set_port(TransportKind::Tcp, 0)
+            .set_port(TransportKind::Quic, 0)
+            .set_port(TransportKind::WebSocketQuic, 0)
+            .set_tls(vec![cert.clone()], key);
+        let frontend = ingress.start().await.unwrap();
+        let tcp_address = frontend.listeners().find(|(kind, _)| *kind == TransportKind::Tcp).unwrap().1;
+        let quic_address = frontend.listeners().find(|(kind, _)| *kind == TransportKind::Quic).unwrap().1;
+        let endpoint = |alpn: &[u8]| {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.clone()).unwrap();
+            let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider()
+            )).with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
+                .with_root_certificates(roots).with_no_client_auth();
+            tls.alpn_protocols = vec![alpn.to_vec()];
+            let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+                QuicClientConfig::try_from(tls).unwrap()
+            )));
+            endpoint
+        };
+        let raw_endpoint = endpoint(QUIC_ALPN);
+        let raw = raw_endpoint.connect(quic_address, "localhost").unwrap().await.unwrap();
+        let ws = QuicWebSocketClientTransport::connect(endpoint(WS_QUIC_ALPN), quic_address, "localhost").await.unwrap();
+        let request = Bytes::from_static(br#"{"jsonrpc":"2.0","method":"identify","id":1}"#);
+        let (mut send, mut receive) = raw.open_bi().await.unwrap();
+        send.write_all(&request).await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&receive.read_to_end(65536).await.unwrap()).unwrap()["result"], "a");
+        assert_eq!(serde_json::from_slice::<Value>(&ws.send(request.clone()).await.unwrap().unwrap()).unwrap()["result"], "a");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(crate::control_plane::serve(listener, gateway.sessions(), inventory(&gateway, address)));
+        let mut plane = BufReader::new(TcpStream::connect(address).await.unwrap());
+        assert_eq!(control(&mut plane, json!({"action":"add_backend","backend":configs[1]})).await["success"], true);
+        assert_eq!(control(&mut plane, json!({"action":"add_backend","backend":configs[1]})).await["error"], "BackendAlreadyExists");
+        assert_eq!(control(&mut plane, json!({"action":"set_backend_enabled","backend_id":"absent","enabled":false})).await["error"], "BackendNotFound");
+        let mut tcp = BufReader::new(TcpStream::connect(tcp_address).await.unwrap());
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..4 {
+            tcp.get_mut().write_all(&request).await.unwrap();
+            tcp.get_mut().write_all(b"\n").await.unwrap();
+            let mut line = String::new();
+            tcp.read_line(&mut line).await.unwrap();
+            seen.insert(serde_json::from_str::<Value>(&line).unwrap()["result"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(seen, ["a".to_owned(), "b".to_owned()].into_iter().collect());
+        let disabled = control(&mut plane, json!({"action":"set_backend_enabled","backend_id":"a","enabled":false})).await;
+        assert_eq!(disabled["success"], true);
+        assert_eq!(disabled["backends"][0]["enabled"], false);
+        raw.closed().await;
+        assert!(ws.send(request.clone()).await.is_err());
+        tcp.get_mut().write_all(&request).await.unwrap();
+        tcp.get_mut().write_all(b"\n").await.unwrap();
+        let mut line = String::new();
+        tcp.read_line(&mut line).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["result"], "b");
+        let discovery = control(&mut plane, json!({"action":"list_methods"})).await;
+        assert_eq!(discovery["success"], true);
+        assert!(!discovery["methods"].as_array().unwrap().contains(&json!("a")));
+        assert!(discovery["methods"].as_array().unwrap().contains(&json!("b")));
+        let restored = BackendPool::load(vec![], file.0.clone()).unwrap();
+        assert_eq!(restored.snapshot().len(), 2);
+        assert!(!restored.snapshot()[0].enabled);
+        assert_eq!(control(&mut plane, json!({"action":"set_backend_enabled","backend_id":"a","enabled":true})).await["success"], true);
+        assert!(raw.close_reason().is_some(), "re-enable must not revive the old session");
+        let listed = control(&mut plane, json!({"action":"list_backends"})).await;
+        assert_eq!(listed["backends"].as_array().unwrap().len(), 2);
+        assert_eq!(control(&mut plane, json!({"action":"list_components"})).await["components"]["balancer"]["backend_count"], 2);
+        drop(tcp);
+        task.abort();
+        frontend.close().await.unwrap();
+        for server in servers { server.close().await.unwrap(); }
+    }).await.expect("hot backend Control Plane acceptance timed out");
+}
+
+#[tokio::test]
 async fn hot_transport_policy_closes_idle_tcp_and_keeps_shared_websockets_alive() {
     use crate::transport_policy::{TransportPolicy, tests::StateFile};
     use futures_util::{SinkExt, StreamExt};

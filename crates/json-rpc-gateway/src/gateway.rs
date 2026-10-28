@@ -464,7 +464,21 @@ impl JsonRpcProtocol for GatewayProtocol {
         context: &'a TransportContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         let token = self.admission(context);
-        Box::pin(async move { token.cancelled().await })
+        let backend = self
+            .gateway
+            .backends
+            .session_cancellation(&context.connection_id);
+        Box::pin(async move {
+            tokio::select! {
+                _ = token.cancelled() => {},
+                _ = async {
+                    match backend {
+                        Some(token) => token.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => {},
+            }
+        })
     }
 
     fn session_close_requested(&self, context: &TransportContext) -> bool {
@@ -561,6 +575,11 @@ impl JsonRpcProtocol for GatewayProtocol {
             .open_session(&context.connection_id, self.source_transport.id())
         {
             tracing::error!(%error, connection_id = %context.connection_id, "cannot bind gateway session to a backend");
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            self.gateway
+                .session_generations
+                .insert(context.connection_id.clone(), cancelled);
             return;
         }
         self.gateway.sessions.register_session(context);

@@ -1,43 +1,12 @@
 # JSON-RPC gateway workspace
 
-## Optional TMS backend plugins
+The `gateway-demo-backend` is a standalone base backend with `echo`, `identify`
+and built-in `rpc.list_methods`. It requires no application-specific features,
+external application configuration or database connections.
 
-`json-rpc-gateway` exposes independent `tms` and `tracking` Cargo features for
-the **`gateway-demo-backend` binary**, not the gateway's routing process.
-The gateway continues to balance requests normally; the selected backend
-executes the enabled methods. Existing `echo` and `identify` remain available.
-
-```sh
-cargo build -p json-rpc-gateway --bin gateway-demo-backend --features tms,tracking
-TMS_MAIN_CONFIG_DIR=/home/dev/TMSBackend/tms-server-main \
-TMS_TRACKING_CONFIG_DIR=/home/dev/TMSBackend/tms-server-tracking \
-BACKEND_BIND=127.0.0.1 BACKEND_TCP_PORT=8081 \
-./target/debug/gateway-demo-backend
-```
-
-Enable just `--features tms` for login/resume/session/shift methods, or
-`--features tracking` for `sendLocation` / `tracking.sendLocation`.
-Without these features no TMS configuration or storage is loaded.
-Each config directory must contain `.env`; nonempty process variables override
-its values. Explicit directories are recommended: the local storage exports
-do not include secret dotenv files. Without the overrides each plugin looks
-for `.env` in its own compile-time crate directory.
-The main plugin supports `QUIC_RPC_SESSION_BACKEND=memory` or Mongo;
-tracking requires its configured PostgreSQL database/schema to exist.
-Configuration/connection failures abort startup rather than silently disabling
-a plugin. Main session/rate-limit cleanup runs every 60 seconds.
-The host installs tracking before main internally, regardless of feature order.
-
-The two versioned plugin dependencies are loaded from `/home/dev/Crates` via
-the project-local `.cargo/config.toml` (`local-crates` source). No `path`
-dependencies on TMSBackend or global Cargo settings are used. Other dependencies
-retain their existing crates.io/Git sources. The workspace patches the plugins'
-registry JSON-RPC core/server/transport dependencies to the same `start` Git
-source already used by this project, ensuring a single set of protocol types.
-Provision the local storage at the same path on other build machines.
-For offline builds, the remaining ordinary/Git dependencies must already be
-cached. Building the gateway binary with these features alone does not execute
-TMS methods in the gateway; run the feature-enabled backend behind it.
+`scripts/deploy-lan-ecosystem.sh` installs the gateway (with its in-process
+balancer) and two base backends on one host. The target IP and ports are
+constants at the top of the script; the ingress port is `8443`.
 
 This workspace separates ingress/session concerns from backend selection:
 
@@ -142,6 +111,8 @@ Check and test the gateway with `cargo check -p json-rpc-gateway` and `cargo tes
 QUIC acceptance tests rebind the client endpoint from `127.0.0.1` to `127.0.0.2`, verify that the same session continues on the same one of two backends, and exercise unicast, multicast and broadcast through an actual TCP Control Plane connection. HTTP acceptance tests verify rejection during an active request and cleanup after its response.
 
 Broker clients have independent push routes, explicit Close and configurable heartbeats/leases. Defaults are 10-second heartbeats and a 45-second lease; under normal broker progress, an abandoned idle session expires after 45..55 seconds. An admitted request may retain its session while in flight. Broker/network operation delays can extend these bounds. Gateway ingress uses `GATEWAY_BROKER_HEARTBEAT_INTERVAL_MS` and `GATEWAY_BROKER_SESSION_LEASE_MS`; broker backend pool entries use the corresponding `broker_heartbeat_interval_ms` and `broker_session_lease_ms` options. An ordinary MQTT/AMQP consumer cannot immediately observe another client's socket loss. Lifecycle controls remain live under saturated dispatch; the bounded dispatcher rejects excess application requests without replay, and their callers time out rather than receiving synthetic business responses. Push is not a durable mailbox.
+
+### Building with SRT
 
 To build with SRT without installing a system `libsrt`, use `scripts/build-with-srt.sh check -p json-rpc-gateway --features srt` (or replace `check` with `build`/`test`). The script fetches the official [`Haivision/srt`](https://github.com/Haivision/srt) source and builds the pinned `v1.5.7` commit with CMake and OpenSSL encryption. It also supplies the C++ runtime and OpenSSL linker flags required by the static library, without forcing unrelated transitive dependencies such as zstd to be linked statically. A C/C++ compiler, CMake, OpenSSL development files, pkg-config, and libclang (required by the Rust bindings generator) must be available. To update SRT, change `srt_tag` and `srt_commit` together in `scripts/build-with-srt.sh`; the immutable commit pin keeps builds reproducible.
 

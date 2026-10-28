@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+readonly gateway_host="192.168.1.132"
+readonly gateway_port=8443
+readonly control_port=8500
+
 [[ $# == 1 && "$1" =~ ^/tmp/jrpc-protocols\.[[:alnum:]]{6}$ ]] || {
     echo "Expected secure gateway staging directory" >&2
     exit 1
@@ -8,14 +12,15 @@ set -Eeuo pipefail
 stage="$1"
 trap 'rm -rf -- "$stage"' EXIT
 systemctl is-active --quiet mosquitto rabbitmq-server
-python3 - <<'PY'
+python3 - "$gateway_port" <<'PY'
 from pathlib import Path
 import subprocess
+import sys
 
 path = Path("/etc/ufw/before.rules")
 text = path.read_text()
 rules = [
-    f"-A ufw-before-input -s 192.168.1.0/24 -p {protocol} -m multiport --dports 18080 -j ACCEPT"
+    f"-A ufw-before-input -s 192.168.1.0/24 -p {protocol} -m multiport --dports {int(sys.argv[1])} -j ACCEPT"
     for protocol in [132, 136]
 ]
 missing = [rule for rule in rules if rule not in text]
@@ -33,20 +38,21 @@ install -o root -g jsonrpc -m 0640 "$stage/server-key.pem" /etc/json-rpc-ecosyst
 cp -p /etc/json-rpc-ecosystem/gateway.env "$stage/gateway.env.before"
 cp -p /opt/json-rpc-ecosystem/bin/json-rpc-gateway "$stage/gateway.before"
 
-python3 - <<'PY'
+python3 - "$gateway_host" "$gateway_port" "$control_port" <<'PY'
 from pathlib import Path
 import secrets
+import sys
 
 path = Path("/etc/json-rpc-ecosystem/gateway.env")
 lines = path.read_text().splitlines()
-updates = {}
+updates = {"GATEWAY_BIND": sys.argv[1], "GATEWAY_PORT": sys.argv[2], "CONTROL_PORT": sys.argv[3]}
 for protocol in [
     "tcp", "tls", "udp", "rtp", "rudp", "srt", "udplite", "sctp",
     "quic", "http1", "http3", "coap", "mqtt", "amqp",
 ]:
     for prefix in ["", "ws-"]:
         name = (prefix + protocol).upper().replace("-", "_")
-        updates[f"GATEWAY_{name}_PORT"] = "18080"
+        updates[f"GATEWAY_{name}_PORT"] = sys.argv[2]
 updates["TLS_CERT_PATH"] = "/etc/json-rpc-ecosystem/tls/server-fullchain.pem"
 updates["TLS_KEY_PATH"] = "/etc/json-rpc-ecosystem/tls/server-key.pem"
 updates["MQTT_BROKER_URL"] = "mqtt://127.0.0.1:1883"
@@ -69,10 +75,10 @@ EOF
 systemctl daemon-reload
 systemctl restart json-rpc-gateway.service
 for ((attempt=0; attempt<60; attempt++)); do
-    if python3 - <<'PY'
-import json, socket
+    if python3 - "$gateway_host" "$control_port" <<'PY'
+import json, socket, sys
 try:
-    with socket.create_connection(("192.168.1.132",18500), timeout=1) as connection:
+    with socket.create_connection((sys.argv[1],int(sys.argv[2])), timeout=1) as connection:
         connection.sendall(b'{"action":"list_components"}\n')
         response = json.loads(connection.makefile("rb").readline())
         listeners = response["components"]["gateway"]["listeners"]

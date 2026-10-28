@@ -19,6 +19,14 @@ const MAX_CONTROL_LINE_BYTES: usize = 64 * 1024;
 enum ControlCommand {
     ListComponents,
     ListMethods,
+    ListBackends,
+    AddBackend {
+        backend: Box<json_rpc_balancer::BackendConfig>,
+    },
+    SetBackendEnabled {
+        backend_id: String,
+        enabled: bool,
+    },
     ListTransports,
     SetTransportEnabled {
         transport: String,
@@ -62,6 +70,8 @@ struct ControlResponse {
     errors: Option<Vec<json_rpc_balancer::MethodDiscoveryError>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transports: Option<Vec<crate::transport_policy::TransportStatus>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backends: Option<Vec<json_rpc_balancer::BackendSnapshot>>,
 }
 
 impl ControlResponse {
@@ -76,6 +86,7 @@ impl ControlResponse {
             complete: None,
             errors: None,
             transports: None,
+            backends: None,
         }
     }
 
@@ -90,6 +101,7 @@ impl ControlResponse {
             complete: None,
             errors: None,
             transports: None,
+            backends: None,
         }
     }
 }
@@ -165,6 +177,36 @@ async fn process_command(
 ) -> ControlResponse {
     if matches!(
         command,
+        ControlCommand::ListBackends
+            | ControlCommand::AddBackend { .. }
+            | ControlCommand::SetBackendEnabled { .. }
+    ) {
+        let result = match command {
+            ControlCommand::ListBackends => Ok(()),
+            ControlCommand::AddBackend { backend } => {
+                inventory.backends.add_backend(*backend).await
+            }
+            ControlCommand::SetBackendEnabled {
+                backend_id,
+                enabled,
+            } => {
+                inventory
+                    .backends
+                    .set_backend_enabled(&backend_id, enabled)
+                    .await
+            }
+            _ => unreachable!(),
+        };
+        if let Err(error) = result {
+            tracing::warn!(?error, "backend control-plane command rejected");
+            return ControlResponse::failure(error.to_string());
+        }
+        let mut response = ControlResponse::success(None);
+        response.backends = Some(inventory.backends.snapshot());
+        return response;
+    }
+    if matches!(
+        command,
         ControlCommand::ListTransports | ControlCommand::SetTransportEnabled { .. }
     ) {
         let Some(policy) = &inventory.transport_policy else {
@@ -205,6 +247,9 @@ async fn process_command(
 fn process_session_command(command: ControlCommand, sessions: &SessionRegistry) -> ControlResponse {
     let action = match &command {
         ControlCommand::ListComponents
+        | ControlCommand::ListBackends
+        | ControlCommand::AddBackend { .. }
+        | ControlCommand::SetBackendEnabled { .. }
         | ControlCommand::ListMethods
         | ControlCommand::ListTransports
         | ControlCommand::SetTransportEnabled { .. } => unreachable!(),
@@ -215,6 +260,9 @@ fn process_session_command(command: ControlCommand, sessions: &SessionRegistry) 
     };
     let result = match command {
         ControlCommand::ListComponents
+        | ControlCommand::ListBackends
+        | ControlCommand::AddBackend { .. }
+        | ControlCommand::SetBackendEnabled { .. }
         | ControlCommand::ListMethods
         | ControlCommand::ListTransports
         | ControlCommand::SetTransportEnabled { .. } => unreachable!(),

@@ -14,7 +14,7 @@ pub struct ComponentInventory {
     listeners: Vec<ListenerInfo>,
     control_address: SocketAddr,
     metrics_address: SocketAddr,
-    backends: Arc<BackendPool>,
+    pub backends: Arc<BackendPool>,
     pub transport_policy: Option<Arc<crate::transport_policy::TransportPolicy>>,
 }
 

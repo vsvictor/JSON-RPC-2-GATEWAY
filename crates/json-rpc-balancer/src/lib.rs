@@ -1,5 +1,6 @@
 use gateway_protocol::{decode_response, encode_request, GATEWAY_PING, GATEWAY_PONG};
 mod connector;
+mod management;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -21,7 +22,8 @@ use tokio::{
     time::{timeout, Instant},
 };
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     pub id: String,
     pub host: String,
@@ -32,7 +34,7 @@ pub struct BackendConfig {
     pub options: BackendOptions,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackendOptions {
     pub tls_ca_path: Option<String>,
@@ -95,15 +97,26 @@ impl LoadBalancingStrategy for RoundRobin {
 }
 
 pub struct BackendPool {
-    backends: Vec<BackendPoolEntry>,
+    backends: std::sync::RwLock<Vec<Arc<BackendPoolEntry>>>,
     strategy: Arc<dyn LoadBalancingStrategy>,
-    affinity: std::sync::Mutex<HashMap<String, usize>>,
+    affinity: std::sync::Mutex<HashMap<String, Affinity>>,
+    updates: Mutex<()>,
+    state_path: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone)]
+struct Affinity {
+    index: usize,
+    cancelled: tokio_util::sync::CancellationToken,
+    admission: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, Serialize)]
 pub struct BackendSnapshot {
     pub id: String,
     pub host: String,
+    pub enabled: bool,
+    pub active_requests: usize,
     pub transports: Vec<TransportSnapshot>,
 }
 
@@ -143,6 +156,60 @@ pub enum CircuitSnapshot {
 struct BackendPoolEntry {
     config: BackendConfig,
     transports: BTreeMap<String, TransportPool>,
+    lifecycle: std::sync::Mutex<BackendLifecycle>,
+}
+
+struct BackendLifecycle {
+    enabled: bool,
+    active: usize,
+    generation: Arc<BackendGeneration>,
+}
+
+#[derive(Default)]
+struct BackendGeneration {
+    active: AtomicUsize,
+    admission: tokio_util::sync::CancellationToken,
+    closed: tokio_util::sync::CancellationToken,
+}
+
+struct BackendRequest<'a> {
+    backend: &'a BackendPoolEntry,
+    generation: Arc<BackendGeneration>,
+}
+
+impl Drop for BackendRequest<'_> {
+    fn drop(&mut self) {
+        let mut state = self.backend.lifecycle.lock().unwrap();
+        state.active -= 1;
+        if self.generation.active.fetch_sub(1, Ordering::AcqRel) == 1
+            && self.generation.admission.is_cancelled()
+        {
+            self.generation.closed.cancel();
+        }
+    }
+}
+
+impl BackendPoolEntry {
+    fn enabled(&self) -> bool {
+        self.lifecycle.lock().unwrap().enabled
+    }
+
+    fn admit(&self, affinity: Option<&Affinity>) -> anyhow::Result<BackendRequest<'_>> {
+        let mut state = self.lifecycle.lock().unwrap();
+        if let Some(affinity) = affinity {
+            anyhow::ensure!(
+                !affinity.admission.is_cancelled(),
+                "QUIC backend session is retired"
+            );
+        }
+        anyhow::ensure!(state.enabled, "backend {} is disabled", self.config.id);
+        state.active += 1;
+        state.generation.active.fetch_add(1, Ordering::Relaxed);
+        Ok(BackendRequest {
+            backend: self,
+            generation: state.generation.clone(),
+        })
+    }
 }
 
 struct TransportPool {
@@ -394,12 +461,18 @@ impl Drop for ManagedConnection {
 }
 
 impl BackendPool {
+    fn entries(&self) -> Vec<Arc<BackendPoolEntry>> {
+        self.backends.read().unwrap().clone()
+    }
+
     /// Query each backend independently without consuming round-robin or session state.
     pub async fn list_methods(&self) -> MethodInventory {
+        let backends: Vec<_> = self.entries().into_iter().filter(|b| b.enabled()).collect();
         let results =
-            futures_util::future::join_all(self.backends.iter().map(|backend| async move {
+            futures_util::future::join_all(backends.iter().map(|backend| async move {
                 let deadline = operation_timeout(backend).min(Duration::from_secs(5));
                 let result = timeout(deadline, async {
+                    let _admission = backend.admit(None)?;
                     let (kind, pool) = Self::route(backend, "tcp");
                     let connection = ManagedConnection {
                         transport: connector::connect(&backend.config, kind, pool.port).await?,
@@ -479,7 +552,7 @@ impl BackendPool {
                 method_details.sort_by(|a, b| a.name.cmp(&b.name));
                 method_details
             },
-            complete: errors.is_empty(),
+            complete: !backends.is_empty() && errors.is_empty(),
             errors,
         }
     }
@@ -487,56 +560,66 @@ impl BackendPool {
     /// A local, non-atomic snapshot; busy slots are not inspected or waited on.
     /// Existing connections and a closed circuit do not prove backend liveness.
     pub fn snapshot(&self) -> Vec<BackendSnapshot> {
-        self.backends
+        self.entries()
             .iter()
-            .map(|backend| BackendSnapshot {
-                id: backend.config.id.clone(),
-                host: backend.config.host.clone(),
-                transports: backend
-                    .transports
-                    .iter()
-                    .map(|(kind, pool)| {
-                        let mut connected_idle_slots = 0;
-                        let mut empty_idle_slots = 0;
-                        let mut busy_slots = 0;
-                        for slot in &pool.slots {
-                            match slot.try_lock() {
-                                Ok(slot) if slot.connection.is_some() => connected_idle_slots += 1,
-                                Ok(_) => empty_idle_slots += 1,
-                                Err(_) => busy_slots += 1,
-                            }
-                        }
-                        let breaker = &pool.circuit_breaker;
-                        let circuit = match &*breaker.state.lock().unwrap() {
-                            CircuitState::Closed {
-                                consecutive_failures,
-                            } => CircuitSnapshot::Closed {
-                                consecutive_failures: *consecutive_failures,
-                            },
-                            CircuitState::Open { opened_at } => CircuitSnapshot::Open {
-                                retry_after_ms: breaker
-                                    .reset_timeout
-                                    .saturating_sub(opened_at.elapsed())
-                                    .as_millis()
-                                    as u64,
-                            },
-                            CircuitState::HalfOpen { probe_in_flight } => {
-                                CircuitSnapshot::HalfOpen {
-                                    probe_in_flight: *probe_in_flight,
+            .map(|backend| {
+                let state = backend.lifecycle.lock().unwrap();
+                let enabled = state.enabled;
+                let active_requests = state.active;
+                drop(state);
+                BackendSnapshot {
+                    id: backend.config.id.clone(),
+                    host: backend.config.host.clone(),
+                    enabled,
+                    active_requests,
+                    transports: backend
+                        .transports
+                        .iter()
+                        .map(|(kind, pool)| {
+                            let mut connected_idle_slots = 0;
+                            let mut empty_idle_slots = 0;
+                            let mut busy_slots = 0;
+                            for slot in &pool.slots {
+                                match slot.try_lock() {
+                                    Ok(slot) if slot.connection.is_some() => {
+                                        connected_idle_slots += 1
+                                    }
+                                    Ok(_) => empty_idle_slots += 1,
+                                    Err(_) => busy_slots += 1,
                                 }
                             }
-                        };
-                        TransportSnapshot {
-                            transport: kind.clone(),
-                            port: pool.port,
-                            pool_size: pool.slots.len(),
-                            connected_idle_slots,
-                            empty_idle_slots,
-                            busy_slots,
-                            circuit,
-                        }
-                    })
-                    .collect(),
+                            let breaker = &pool.circuit_breaker;
+                            let circuit = match &*breaker.state.lock().unwrap() {
+                                CircuitState::Closed {
+                                    consecutive_failures,
+                                } => CircuitSnapshot::Closed {
+                                    consecutive_failures: *consecutive_failures,
+                                },
+                                CircuitState::Open { opened_at } => CircuitSnapshot::Open {
+                                    retry_after_ms: breaker
+                                        .reset_timeout
+                                        .saturating_sub(opened_at.elapsed())
+                                        .as_millis()
+                                        as u64,
+                                },
+                                CircuitState::HalfOpen { probe_in_flight } => {
+                                    CircuitSnapshot::HalfOpen {
+                                        probe_in_flight: *probe_in_flight,
+                                    }
+                                }
+                            };
+                            TransportSnapshot {
+                                transport: kind.clone(),
+                                port: pool.port,
+                                pool_size: pool.slots.len(),
+                                connected_idle_slots,
+                                empty_idle_slots,
+                                busy_slots,
+                                circuit,
+                            }
+                        })
+                        .collect(),
+                }
             })
             .collect()
     }
@@ -637,12 +720,22 @@ impl BackendPool {
                     },
                 );
             }
-            backends.push(BackendPoolEntry { config, transports });
+            backends.push(Arc::new(BackendPoolEntry {
+                config,
+                transports,
+                lifecycle: std::sync::Mutex::new(BackendLifecycle {
+                    enabled: true,
+                    active: 0,
+                    generation: Arc::new(BackendGeneration::default()),
+                }),
+            }));
         }
         Ok(Self {
-            backends,
+            backends: std::sync::RwLock::new(backends),
             strategy,
             affinity: Default::default(),
+            updates: Mutex::new(()),
+            state_path: None,
         })
     }
 
@@ -655,12 +748,26 @@ impl BackendPool {
         if let std::collections::hash_map::Entry::Vacant(entry) =
             affinity.entry(connection_id.to_owned())
         {
-            let index = self.strategy.select(self.backends.len());
+            let backends = self.entries();
+            let candidates: Vec<_> = backends
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.enabled())
+                .collect();
+            anyhow::ensure!(!candidates.is_empty(), "no enabled backend is available");
+            let selected = self.strategy.select(candidates.len());
             anyhow::ensure!(
-                index < self.backends.len(),
+                selected < candidates.len(),
                 "load balancing strategy selected an invalid backend index"
             );
-            entry.insert(index);
+            let (index, backend) = candidates[selected];
+            let state = backend.lifecycle.lock().unwrap();
+            anyhow::ensure!(state.enabled, "selected backend is disabled");
+            entry.insert(Affinity {
+                index,
+                cancelled: state.generation.closed.clone(),
+                admission: state.generation.admission.clone(),
+            });
         }
         Ok(())
     }
@@ -669,9 +776,23 @@ impl BackendPool {
         self.affinity.lock().unwrap().remove(connection_id);
     }
 
+    pub fn session_cancellation(
+        &self,
+        connection_id: &str,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        self.affinity
+            .lock()
+            .unwrap()
+            .get(connection_id)
+            .map(|a| a.cancelled.clone())
+    }
+
     /// Establish and validate all configured connections before accepting traffic.
     pub async fn warm_up(&self) -> anyhow::Result<()> {
-        for backend in &self.backends {
+        for backend in &self.entries() {
+            if !backend.enabled() {
+                continue;
+            }
             for (kind, pool) in &backend.transports {
                 for slot in &pool.slots {
                     let mut slot = slot.lock().await;
@@ -713,23 +834,32 @@ impl BackendPool {
         trace_id: u64,
     ) -> anyhow::Result<Option<Bytes>> {
         let request = encode_request(payload, connection_id, source_transport)?;
-        let affinity_index = if matches!(source_transport, "quic" | "ws-quic") {
+        let backends = self.entries();
+        let affinity = if matches!(source_transport, "quic" | "ws-quic") {
             Some(
-                *self
-                    .affinity
+                self.affinity
                     .lock()
                     .unwrap()
                     .get(connection_id)
-                    .context("QUIC session is not registered or has already closed")?,
+                    .context("QUIC session is not registered or has already closed")?
+                    .clone(),
             )
         } else {
             None
         };
-        let (backend, kind, pool, permit) = if let Some(index) = affinity_index {
-            let backend = self
-                .backends
-                .get(index)
+        let (backend, kind, pool, permit) = if let Some(affinity) = &affinity {
+            anyhow::ensure!(
+                !affinity.admission.is_cancelled(),
+                "QUIC backend session is retired"
+            );
+            let backend = backends
+                .get(affinity.index)
                 .context("QUIC affinity selected an invalid backend index")?;
+            anyhow::ensure!(
+                backend.enabled(),
+                "pinned backend {} is disabled",
+                backend.config.id
+            );
             let (kind, pool) = Self::route(backend, source_transport);
             let permit = pool.circuit_breaker.acquire().inspect_err(|error| {
                 let reason = if error.to_string().contains("half-open") {
@@ -747,16 +877,18 @@ impl BackendPool {
             })?;
             (backend, kind, pool, permit)
         } else {
-            let first = self.strategy.select(self.backends.len());
+            let candidates: Vec<_> = backends.iter().filter(|b| b.enabled()).collect();
+            anyhow::ensure!(!candidates.is_empty(), "no enabled backend is available");
+            let first = self.strategy.select(candidates.len());
             anyhow::ensure!(
-                first < self.backends.len(),
+                first < candidates.len(),
                 "load balancing strategy selected an invalid backend index"
             );
             let mut selected = None;
             let mut last_error = None;
-            for offset in 0..self.backends.len() {
-                let index = (first + offset) % self.backends.len();
-                let backend = &self.backends[index];
+            for offset in 0..candidates.len() {
+                let index = (first + offset) % candidates.len();
+                let backend = candidates[index];
                 let (kind, pool) = Self::route(backend, source_transport);
                 match pool.circuit_breaker.acquire() {
                     Ok(permit) => {
@@ -777,10 +909,11 @@ impl BackendPool {
                 last_error.unwrap_or_else(|| anyhow::anyhow!("no backend endpoint is available"))
             })?
         };
+        let mut slot = pool.slots[pool.cursor.select(pool.slots.len())]
+            .lock()
+            .await;
+        let _admission = backend.admit(affinity.as_ref())?;
         let result = async {
-            let mut slot = pool.slots[pool.cursor.select(pool.slots.len())]
-                .lock()
-                .await;
             if slot.connection.is_none()
                 || permit.is_half_open()
                 || slot
@@ -843,7 +976,9 @@ impl BackendPool {
                 response_payload = %response.as_ref().map(|bytes| String::from_utf8_lossy(bytes)).unwrap_or_default(),
                 "received backend response"
             );
-            slot.connection = Some(connection);
+            if backend.enabled() {
+                slot.connection = Some(connection);
+            }
             Ok(response)
         }
         .await;
@@ -907,10 +1042,18 @@ impl BackendPool {
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 let Some(pool) = weak.upgrade() else { break };
-                for backend in &pool.backends {
+                for backend in &pool.entries() {
                     for (kind, transport) in &backend.transports {
                         for slot in &transport.slots {
                             let Ok(mut slot) = slot.try_lock() else {
+                                continue;
+                            };
+                            if !backend.enabled() {
+                                slot.connection.take();
+                                slot.checked_at = None;
+                                continue;
+                            }
+                            let Ok(_admission) = backend.admit(None) else {
                                 continue;
                             };
                             if slot
@@ -1049,7 +1192,8 @@ mod tests {
     #[tokio::test]
     async fn snapshot_reports_busy_slots_and_circuit_transitions_without_probing() {
         let pool = BackendPool::new(vec![config(8081, "tcp")]).unwrap();
-        let transport = &pool.backends[0].transports["tcp"];
+        let entries = pool.entries();
+        let transport = &entries[0].transports["tcp"];
         let locked = transport.slots[0].lock().await;
         let snapshot = pool.snapshot();
         assert_eq!(snapshot[0].transports[0].busy_slots, 1);
@@ -1133,7 +1277,7 @@ mod tests {
 
         let pool = BackendPool::new(configs).unwrap();
         pool.warm_up().await.unwrap();
-        pool.backends[0].transports["tcp"]
+        pool.entries()[0].transports["tcp"]
             .circuit_breaker
             .acquire()
             .unwrap()
@@ -1149,10 +1293,20 @@ mod tests {
         assert_eq!(response["result"]["backend"], 1);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
-        pool.affinity
+        let generation = pool.entries()[0]
+            .lifecycle
             .lock()
             .unwrap()
-            .insert("sticky-session".to_owned(), 0);
+            .generation
+            .clone();
+        pool.affinity.lock().unwrap().insert(
+            "sticky-session".to_owned(),
+            Affinity {
+                index: 0,
+                cancelled: generation.closed.clone(),
+                admission: generation.admission.clone(),
+            },
+        );
         let affinity_error = pool
             .forward(&request, "quic", "sticky-session")
             .await
@@ -1173,8 +1327,8 @@ mod tests {
         let mut config = config(80, "http1");
         config.ports.insert("tcp".into(), 81);
         let pool = BackendPool::new(vec![config]).unwrap();
-        assert_eq!(BackendPool::route(&pool.backends[0], "http1").0, "http1");
-        assert_eq!(BackendPool::route(&pool.backends[0], "ws-tcp").0, "tcp");
+        assert_eq!(BackendPool::route(&pool.entries()[0], "http1").0, "http1");
+        assert_eq!(BackendPool::route(&pool.entries()[0], "ws-tcp").0, "tcp");
     }
 
     #[test]
@@ -1444,7 +1598,8 @@ mod tests {
             let running = server.start().await.unwrap();
             let pool = BackendPool::new(vec![config(port, kind.id())]).unwrap();
             pool.warm_up().await.unwrap();
-            let slot = pool.backends[0].transports[kind.id()].slots[0].lock().await;
+            let entries = pool.entries();
+            let slot = entries[0].transports[kind.id()].slots[0].lock().await;
             let original = Arc::downgrade(&slot.connection.as_ref().unwrap().transport);
             drop(slot);
             for _ in 0..2 {
@@ -1470,7 +1625,7 @@ mod tests {
                     1
                 );
             }
-            let slot = pool.backends[0].transports[kind.id()].slots[0].lock().await;
+            let slot = entries[0].transports[kind.id()].slots[0].lock().await;
             assert!(
                 original.ptr_eq(&Arc::downgrade(
                     &slot.connection.as_ref().unwrap().transport
@@ -1479,6 +1634,7 @@ mod tests {
                 kind.id()
             );
             drop(slot);
+            drop(entries);
             drop(pool);
             running.close().await.unwrap();
         }
@@ -1669,7 +1825,7 @@ mod tests {
         pool.warm_up().await.unwrap();
         let slow = Bytes::from_static(b"{\"jsonrpc\":\"2.0\",\"method\":\"slow\",\"id\":1}");
         assert!(pool.forward(&slow, "tcp", "client").await.is_err());
-        assert!(pool.backends[0].transports["tcp"].slots[0]
+        assert!(pool.entries()[0].transports["tcp"].slots[0]
             .lock()
             .await
             .connection
@@ -1727,14 +1883,13 @@ mod tests {
         pool.warm_up().await.unwrap();
         running.close().await.unwrap();
         pool.start_maintenance();
+        let entries = pool.entries();
         timeout(Duration::from_secs(2), async {
             loop {
-                let slot = pool.backends[0].transports["tcp"].slots[0].lock().await;
+                let slot = entries[0].transports["tcp"].slots[0].lock().await;
                 if slot.connection.is_none()
                     && slot.checked_at.is_some()
-                    && !pool.backends[0].transports["tcp"]
-                        .circuit_breaker
-                        .is_closed()
+                    && !entries[0].transports["tcp"].circuit_breaker.is_closed()
                 {
                     break;
                 }
@@ -1744,14 +1899,14 @@ mod tests {
         })
         .await
         .unwrap();
-        let checked_at = pool.backends[0].transports["tcp"].slots[0]
+        let checked_at = entries[0].transports["tcp"].slots[0]
             .lock()
             .await
             .checked_at
             .unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert_eq!(
-            pool.backends[0].transports["tcp"].slots[0]
+            entries[0].transports["tcp"].slots[0]
                 .lock()
                 .await
                 .checked_at,

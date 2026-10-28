@@ -2,25 +2,18 @@
 set -Eeuo pipefail
 
 readonly gateway_host="192.168.1.132"
-readonly remote_backend_host="192.168.1.131"
-readonly ssh_user="${SSH_USER:-$(id -un)}"
+readonly gateway_port=8443
+readonly control_port=8500
+readonly backend_1_port=8081
+readonly backend_2_port=8082
+readonly ssh_user="${SSH_USER:-dev}"
 readonly service_user="${SERVICE_USER:-jsonrpc}"
-readonly gateway_port="${GATEWAY_PORT:-18080}"
-readonly control_port="${CONTROL_PORT:-18500}"
-readonly backend_132_1_port="${BACKEND_132_1_PORT:-18081}"
-readonly backend_132_2_port="${BACKEND_132_2_PORT:-18082}"
-readonly backend_131_port="${BACKEND_131_PORT:-18081}"
 readonly deploy_id="jrpc-ecosystem-$$"
 
 fail() {
     printf 'Error: %s\n' "$*" >&2
     exit 1
 }
-
-if [[ -f /etc/systemd/system/json-rpc-backend-131.service.d/plugins.conf &&
-    "${ALLOW_DEMO_BACKEND_DOWNGRADE:-0}" != 1 ]]; then
-    fail "TMS/tracking backends are installed; use scripts/update-lan-backends.sh. Set ALLOW_DEMO_BACKEND_DOWNGRADE=1 only for an intentional demo-only downgrade."
-fi
 
 validate_port() {
     local name="$1"
@@ -31,14 +24,13 @@ validate_port() {
 
 validate_port GATEWAY_PORT "$gateway_port"
 validate_port CONTROL_PORT "$control_port"
-validate_port BACKEND_132_1_PORT "$backend_132_1_port"
-validate_port BACKEND_132_2_PORT "$backend_132_2_port"
-validate_port BACKEND_131_PORT "$backend_131_port"
-[[ "$backend_132_1_port" != "$backend_132_2_port" ]] ||
+validate_port BACKEND_1_PORT "$backend_1_port"
+validate_port BACKEND_2_PORT "$backend_2_port"
+[[ "$backend_1_port" != "$backend_2_port" ]] ||
     fail "the two backend instances on $gateway_host need different TCP ports"
 [[ "$gateway_port" != "$control_port" ]] ||
     fail "GATEWAY_PORT and CONTROL_PORT must differ"
-for port in "$backend_132_1_port" "$backend_132_2_port"; do
+for port in "$backend_1_port" "$backend_2_port"; do
     [[ "$port" != "$gateway_port" && "$port" != "$control_port" ]] ||
         fail "backend ports on $gateway_host must differ from gateway and control ports"
 done
@@ -53,20 +45,15 @@ is_local_host() {
     hostname -I | tr ' ' '\n' | grep -Fxq "$1"
 }
 
-if ! is_local_host "$remote_backend_host"; then
-    fail "run this script on $remote_backend_host, or update its local-node deployment logic"
-fi
-
-printf 'Checking local sudo and systemd on %s...\n' "$remote_backend_host"
-if [[ -n "${SUDO_PASSWORD:-}" ]]; then
-    printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' true
-else
-    sudo -n true || fail "set SUDO_PASSWORD for this run or configure passwordless sudo"
-fi
-command -v systemctl >/dev/null || fail "systemd is required on $remote_backend_host"
-
-printf 'Checking SSH and sudo on %s...\n' "$gateway_host"
-if [[ -n "${SUDO_PASSWORD:-}" ]]; then
+printf 'Checking sudo and systemd on %s...\n' "$gateway_host"
+if is_local_host "$gateway_host"; then
+    command -v systemctl >/dev/null || fail "systemd is required"
+    if [[ -n "${SUDO_PASSWORD:-}" ]]; then
+        printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' true
+    else
+        sudo -n true || fail "sudo access is required"
+    fi
+elif [[ -n "${SUDO_PASSWORD:-}" ]]; then
     printf '%s\n' "$SUDO_PASSWORD" |
         ssh -o BatchMode=yes "${ssh_user}@${gateway_host}" 'sudo -S -p "" true'
 else
@@ -84,11 +71,9 @@ fi
 stage_dir="$(mktemp -d)"
 trap 'rm -rf -- "$stage_dir"' EXIT
 
-mkdir -p "$stage_dir/gateway" "$stage_dir/remote-backend"
+mkdir -p "$stage_dir/gateway"
 install -m 0755 "$project_root/scripts/install-lan-ecosystem-node.sh" \
     "$stage_dir/gateway/install-node.sh"
-install -m 0755 "$project_root/scripts/install-lan-ecosystem-node.sh" \
-    "$stage_dir/remote-backend/install-node.sh"
 
 printf 'Building gateway and gateway-compatible demo backend...\n'
 cargo build --locked --release \
@@ -98,27 +83,20 @@ cargo build --locked --release \
 
 install -m 0755 "$target_dir/release/json-rpc-gateway" "$stage_dir/gateway/"
 install -m 0755 "$target_dir/release/gateway-demo-backend" "$stage_dir/gateway/"
-install -m 0755 "$target_dir/release/gateway-demo-backend" "$stage_dir/remote-backend/"
 
 cat >"$stage_dir/gateway/backends.json" <<EOF
 {
   "backends": [
     {
-      "id": "backend-132-1",
+      "id": "backend-1",
       "host": "$gateway_host",
-      "ports": { "tcp": $backend_132_1_port, "udp": $backend_132_1_port },
+      "ports": { "tcp": $backend_1_port, "udp": $backend_1_port },
       "pool_size": 4
     },
     {
-      "id": "backend-132-2",
+      "id": "backend-2",
       "host": "$gateway_host",
-      "ports": { "tcp": $backend_132_2_port, "udp": $backend_132_2_port },
-      "pool_size": 4
-    },
-    {
-      "id": "backend-131",
-      "host": "$remote_backend_host",
-      "ports": { "tcp": $backend_131_port, "udp": $backend_131_port },
+      "ports": { "tcp": $backend_2_port, "udp": $backend_2_port },
       "pool_size": 4
     }
   ]
@@ -135,22 +113,16 @@ METRICS_BIND=127.0.0.1
 METRICS_PORT=9090
 EOF
 
-cat >"$stage_dir/gateway/backend-132-1.env" <<EOF
-BACKEND_ID=backend-132-1
+cat >"$stage_dir/gateway/backend-1.env" <<EOF
+BACKEND_ID=backend-1
 BACKEND_BIND=$gateway_host
-BACKEND_TCP_PORT=$backend_132_1_port
+BACKEND_TCP_PORT=$backend_1_port
 EOF
-cat >"$stage_dir/gateway/backend-132-2.env" <<EOF
-BACKEND_ID=backend-132-2
+cat >"$stage_dir/gateway/backend-2.env" <<EOF
+BACKEND_ID=backend-2
 BACKEND_BIND=$gateway_host
-BACKEND_TCP_PORT=$backend_132_2_port
+BACKEND_TCP_PORT=$backend_2_port
 EOF
-cat >"$stage_dir/remote-backend/backend-131.env" <<EOF
-BACKEND_ID=backend-131
-BACKEND_BIND=$remote_backend_host
-BACKEND_TCP_PORT=$backend_131_port
-EOF
-cp "$stage_dir/remote-backend/backend-131.env" "$stage_dir/gateway/"
 
 write_backend_unit() {
     local id="$1"
@@ -180,16 +152,15 @@ WantedBy=multi-user.target
 EOF
 }
 
-write_backend_unit "backend-132-1" "backend-132-1.env" "$stage_dir/gateway/json-rpc-backend-132-1.service"
-write_backend_unit "backend-132-2" "backend-132-2.env" "$stage_dir/gateway/json-rpc-backend-132-2.service"
-write_backend_unit "backend-131" "backend-131.env" "$stage_dir/remote-backend/json-rpc-backend-131.service"
+write_backend_unit "backend-1" "backend-1.env" "$stage_dir/gateway/json-rpc-backend-1.service"
+write_backend_unit "backend-2" "backend-2.env" "$stage_dir/gateway/json-rpc-backend-2.service"
 
 cat >"$stage_dir/gateway/json-rpc-gateway.service" <<EOF
 [Unit]
 Description=JSON-RPC Gateway and Balancer
-After=network-online.target json-rpc-backend-132-1.service json-rpc-backend-132-2.service
+After=network-online.target json-rpc-backend-1.service json-rpc-backend-2.service
 Wants=network-online.target
-Requires=json-rpc-backend-132-1.service json-rpc-backend-132-2.service
+Requires=json-rpc-backend-1.service json-rpc-backend-2.service
 
 [Service]
 Type=simple
@@ -244,16 +215,13 @@ deploy_node() {
     fi
 }
 
-printf 'Deploying the backend on %s first...\n' "$remote_backend_host"
-deploy_node "$remote_backend_host" remote-backend
 printf 'Deploying two backends and the gateway on %s...\n' "$gateway_host"
 deploy_node "$gateway_host" gateway
 
 printf '\nDeployment complete.\n'
 printf 'Gateway TCP/UDP ingress: %s:%s\n' "$gateway_host" "$gateway_port"
-printf 'Backends: %s:%s, %s:%s, %s:%s\n' \
-    "$gateway_host" "$backend_132_1_port" \
-    "$gateway_host" "$backend_132_2_port" \
-    "$remote_backend_host" "$backend_131_port"
+printf 'Backends: %s:%s, %s:%s\n' \
+    "$gateway_host" "$backend_1_port" \
+    "$gateway_host" "$backend_2_port"
 printf 'Metrics: http://127.0.0.1:9090/metrics on %s\n' "$gateway_host"
 printf 'RPC test method: identify (returns the selected demo backend ID)\n'

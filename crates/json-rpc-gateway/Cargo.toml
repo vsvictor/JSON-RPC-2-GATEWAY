@@ -7,13 +7,9 @@ edition = "2024"
 default = ["websocket"]
 srt = ["json-rpc-2-runtime/srt", "json-rpc-2-websockets/srt", "json-rpc-balancer/srt"]
 websocket = []
-tms = ["dep:tms-server-main"]
-tracking = ["dep:tms-server-tracking"]
 
 [dependencies]
 anyhow = "1"
-tms-server-main = { version = "=0.1.0", registry = "local-crates", optional = true }
-tms-server-tracking = { version = "=0.1.0", registry = "local-crates", optional = true }
 bytes = "1"
 dashmap = "6"
 dotenvy = "0.15.7"
@@ -38,7 +34,6 @@ json-rpc-2-datagram.workspace = true
 json-rpc-balancer = { path = "../json-rpc-balancer" }
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 metrics = "0.24"
-gateway-sessions.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -57,7 +52,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-async-trait = "0.1"
 json-rpc-2-client = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
 rcgen = "0.13"
 

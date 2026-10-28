@@ -37,7 +37,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing::info!(%metrics_address, "Prometheus metrics listening");
 
     let backends = config.load_backends()?;
-    let pool = BackendPool::new(backends)?;
+    let pool = BackendPool::load(
+        backends,
+        std::env::var_os("GATEWAY_BACKEND_STATE_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/var/lib/json-rpc-gateway/backends.json".into()),
+    )?;
     pool.warm_up().await?;
     let policy = transport_policy::TransportPolicy::load(
         config.transport_ports.keys().copied(),
