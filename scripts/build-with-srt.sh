@@ -44,7 +44,7 @@ cmake --build "$srt_build" --parallel
 cmake --install "$srt_build"
 
 export PKG_CONFIG_PATH="$srt_prefix/lib/pkgconfig:$srt_prefix/lib64/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-unset PKG_CONFIG_ALL_STATIC
+unset PKG_CONFIG_ALL_STATIC SRT_STATIC SRT_FORCE_VENDORED SRT_NO_PKG_CONFIG
 pkg-config --atleast-version=1.5 srt
 
 case "$(uname -s)" in
@@ -60,6 +60,12 @@ case "$(uname -s)" in
         ;;
 esac
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$srt_link_flags"
+
+read -r -a srt_cflags <<<"$(pkg-config --cflags srt)"
+read -r -a srt_libraries <<<"$(pkg-config --libs srt) $(pkg-config --libs openssl)"
+"${CXX:-c++}" "${srt_cflags[@]}" "$project_root/scripts/tests/srt-encryption.cpp" \
+    -o "$srt_build/check-encryption" "${srt_libraries[@]}"
+"$srt_build/check-encryption"
 
 cd "$project_root"
 exec cargo "$@"

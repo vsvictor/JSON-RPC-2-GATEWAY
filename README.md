@@ -132,6 +132,10 @@ Broker clients have independent push routes, explicit Close and configurable hea
 
 To build with SRT without installing a system `libsrt`, use `scripts/build-with-srt.sh check -p json-rpc-gateway --features srt` (or replace `check` with `build`/`test`). The script fetches the official [`Haivision/srt`](https://github.com/Haivision/srt) source and builds the pinned `v1.5.7` commit with CMake and OpenSSL encryption. It also supplies the C++ runtime and OpenSSL linker flags required by the static library, without forcing unrelated transitive dependencies such as zstd to be linked statically. A C/C++ compiler, CMake, OpenSSL development files, pkg-config, and libclang (required by the Rust bindings generator) must be available. To update SRT, change `srt_tag` and `srt_commit` together in `scripts/build-with-srt.sh`; the immutable commit pin keeps builds reproducible.
 
+For SRT releases, run the wrapper rather than setting `PKG_CONFIG_PATH` manually: a missing library can make the Rust bindings silently build a vendored library without encryption, preventing gateway startup. The wrapper clears vendored-build overrides, selects static SRT linking only, and checks `SRTO_PBKEYLEN` and `SRTO_PASSPHRASE` before running Cargo.
+
+Для SRT-релізів запускайте цей скрипт, а не задавайте `PKG_CONFIG_PATH` вручну: за відсутності бібліотеки Rust bindings можуть непомітно зібрати vendored-бібліотеку без шифрування, що блокує запуск gateway. Скрипт прибирає перевизначення vendored-збірки, обирає статичне компонування лише для SRT та перевіряє `SRTO_PBKEYLEN` і `SRTO_PASSPHRASE` перед запуском Cargo.
+
 For SRT/WS-SRT ingress, enable the `srt` feature, configure the listener port and set `GATEWAY_SRT_PASSPHRASE` to a shared secret of 10..79 bytes. Startup validates it before opening listeners. This is independent of per-backend `srt_passphrase_env` settings.
 
 Linux/Android UDP-Lite ingress accepts `GATEWAY_UDPLITE_SEND_CHECKSUM_COVERAGE` and `GATEWAY_UDPLITE_RECV_CHECKSUM_COVERAGE` in bytes (default `8`). Coverage `0` protects the entire packet; partial coverage must be at least `8`. Invalid values fail startup.
