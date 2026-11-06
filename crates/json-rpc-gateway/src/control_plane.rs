@@ -38,8 +38,16 @@ enum ControlCommand {
         #[serde(default)]
         groups: Vec<String>,
     },
+    RegisterSession {
+        connection_id: String,
+        session_id: String,
+    },
     PushUnicast {
         client_id: String,
+        payload: String,
+    },
+    PushSession {
+        session_id: String,
         payload: String,
     },
     PushMulticast {
@@ -254,7 +262,9 @@ fn process_session_command(command: ControlCommand, sessions: &SessionRegistry) 
         | ControlCommand::ListTransports
         | ControlCommand::SetTransportEnabled { .. } => unreachable!(),
         ControlCommand::RegisterClient { .. } => "register_client",
+        ControlCommand::RegisterSession { .. } => "register_session",
         ControlCommand::PushUnicast { .. } => "push_unicast",
+        ControlCommand::PushSession { .. } => "push_session",
         ControlCommand::PushMulticast { .. } => "push_multicast",
         ControlCommand::PushBroadcast { .. } => "push_broadcast",
     };
@@ -273,8 +283,20 @@ fn process_session_command(command: ControlCommand, sessions: &SessionRegistry) 
         } => sessions
             .register_client(&connection_id, client_id, groups)
             .map(|()| None),
+        ControlCommand::RegisterSession {
+            connection_id,
+            session_id,
+        } => sessions
+            .register_authenticated_session(&connection_id, session_id)
+            .map(|()| None),
         ControlCommand::PushUnicast { client_id, payload } => sessions
             .push_unicast(&client_id, Bytes::from(payload))
+            .map(|()| None),
+        ControlCommand::PushSession {
+            session_id,
+            payload,
+        } => sessions
+            .push_authenticated_session(&session_id, Bytes::from(payload))
             .map(|()| None),
         ControlCommand::PushMulticast { group_id, payload } => sessions
             .push_multicast(&group_id, Bytes::from(payload))
@@ -300,6 +322,7 @@ fn process_session_command(command: ControlCommand, sessions: &SessionRegistry) 
 mod tests {
     use super::*;
     use crate::components::ListenerInfo;
+    use json_rpc_2_runtime::TransportSession;
     use json_rpc_balancer::{BackendConfig, BackendPool};
     use tokio::time::{Duration, timeout};
 
@@ -338,6 +361,7 @@ mod tests {
                 });
                 servers.push(running);
             }
+
             let pool = Arc::new(BackendPool::new(configs).unwrap());
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -408,6 +432,36 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_plane_registers_and_pushes_by_authenticated_session_id() {
+        let sessions = SessionRegistry::new();
+        let mut transport = TransportSession::new("tcp", true);
+        let connection_id = transport.context.connection_id.clone();
+        sessions.register_session(&transport.context);
+
+        let register: ControlCommand = serde_json::from_value(serde_json::json!({
+            "action":"register_session",
+            "connection_id":connection_id,
+            "session_id":"sess-authenticated-user"
+        }))
+        .unwrap();
+        assert!(process_session_command(register, &sessions).success);
+
+        let push: ControlCommand = serde_json::from_value(serde_json::json!({
+            "action":"push_session",
+            "session_id":"sess-authenticated-user",
+            "payload":"{\"jsonrpc\":\"2.0\",\"method\":\"notifyBalance\",\"params\":{\"amount\":42}}"
+        }))
+        .unwrap();
+        assert!(process_session_command(push, &sessions).success);
+        assert_eq!(
+            transport.push_receiver.recv().await.unwrap(),
+            Bytes::from_static(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"notifyBalance\",\"params\":{\"amount\":42}}"
+            )
+        );
     }
 
     #[tokio::test]

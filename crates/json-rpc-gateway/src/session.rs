@@ -22,6 +22,7 @@ pub struct SessionRegistry {
     metadata: std::sync::Mutex<()>,
     sessions: DashMap<String, ClientSession>,
     clients: DashMap<String, ClientRegistration>,
+    authenticated_sessions: DashMap<String, String>,
     groups: DashMap<String, DashSet<String>>,
 }
 
@@ -95,6 +96,39 @@ impl SessionRegistry {
             "registered gateway client"
         );
         Ok(())
+    }
+
+    pub fn register_authenticated_session(
+        &self,
+        connection_id: &str,
+        session_id: String,
+    ) -> Result<(), String> {
+        if session_id.trim().is_empty()
+            || session_id.len() > 255
+            || session_id.chars().any(char::is_control)
+        {
+            return Err("InvalidSessionId".to_owned());
+        }
+        let _metadata = self.metadata.lock().unwrap();
+        if !self.sessions.contains_key(connection_id) {
+            return Err("UnknownConnection".to_owned());
+        }
+        self.authenticated_sessions
+            .insert(session_id, connection_id.to_owned());
+        Ok(())
+    }
+
+    pub fn push_authenticated_session(
+        &self,
+        session_id: &str,
+        payload: Bytes,
+    ) -> Result<(), String> {
+        let connection_id = self
+            .authenticated_sessions
+            .get(session_id)
+            .map(|entry| entry.clone())
+            .ok_or_else(|| "SessionNotFound".to_owned())?;
+        self.send_to_connection(&connection_id, payload)
     }
 
     pub fn push_unicast(&self, client_id: &str, payload: Bytes) -> Result<(), String> {
@@ -190,6 +224,15 @@ impl SessionRegistry {
                     self.remove_group_member(&group, &client_id);
                 }
             }
+        }
+        let stale_sessions = self
+            .authenticated_sessions
+            .iter()
+            .filter(|entry| entry.value() == connection_id)
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for session_id in stale_sessions {
+            self.authenticated_sessions.remove(&session_id);
         }
     }
 
@@ -299,6 +342,60 @@ mod tests {
             session.push_receiver.recv().await.unwrap(),
             Bytes::from_static(b"push")
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_session_id_routes_push_and_is_removed_on_disconnect() {
+        let registry = SessionRegistry::new();
+        let mut session = TransportSession::new("quic", true);
+        let connection_id = session.context.connection_id.clone();
+        registry.register_session(&session.context);
+        registry
+            .register_authenticated_session(&connection_id, "sess-user-1".into())
+            .unwrap();
+        registry
+            .push_authenticated_session("sess-user-1", Bytes::from_static(b"push-by-session"))
+            .unwrap();
+        assert_eq!(
+            session.push_receiver.recv().await.unwrap(),
+            Bytes::from_static(b"push-by-session")
+        );
+        registry.remove_session(&connection_id);
+        assert_eq!(
+            registry.push_authenticated_session("sess-user-1", Bytes::from_static(b"late")),
+            Err("SessionNotFound".to_owned())
+        );
+        assert_eq!(
+            registry.register_authenticated_session("", "bad\nsession".into()),
+            Err("InvalidSessionId".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_session_moves_to_new_connection_without_old_disconnect_removing_it() {
+        let registry = SessionRegistry::new();
+        let mut old = TransportSession::new("tcp", true);
+        let mut resumed = TransportSession::new("quic", true);
+        let old_connection = old.context.connection_id.clone();
+        let resumed_connection = resumed.context.connection_id.clone();
+        registry.register_session(&old.context);
+        registry.register_session(&resumed.context);
+        registry
+            .register_authenticated_session(&old_connection, "sess-user-1".into())
+            .unwrap();
+        registry
+            .register_authenticated_session(&resumed_connection, "sess-user-1".into())
+            .unwrap();
+
+        registry.remove_session(&old_connection);
+        registry
+            .push_authenticated_session("sess-user-1", Bytes::from_static(b"resumed"))
+            .unwrap();
+        assert_eq!(
+            resumed.push_receiver.recv().await.unwrap(),
+            Bytes::from_static(b"resumed")
+        );
+        assert!(old.push_receiver.try_recv().is_err());
     }
 
     #[test]

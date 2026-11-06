@@ -13,6 +13,22 @@ This workspace separates ingress/session concerns from backend selection:
 - `json-rpc-gateway` is the transport-facing adapter, message bus, configuration loader, and Control Plane.
 - `json-rpc-balancer` owns backend endpoint validation, load-balancing strategy, and persistent backend connection pools.
 - `gateway-iot` owns IoT server adapters, broker ingress configuration, and server-side broker I/O; `json-rpc-2-iot` retains client transports. `gateway-sessions` is a separately consumable crate for broker session identity, lifecycle metadata, heartbeat/lease policy, and runtime orchestration. Its `SessionRuntime` validates metadata, applies lifecycle transitions, admits RPC work, and owns transport session resources.
+
+Authenticated session push uses the backend-issued TMS `sessionId`: successful
+`login`/`resume` calls register that ID against the gateway transport connection.
+Internal services send
+`{"action":"push_session","session_id":"<sessionId>","payload":"<JSON-RPC message>"}` to
+the Control Plane. The gateway routes the payload without inspecting its JSON-RPC
+business content and removes the binding when the transport connection closes.
+See the TMS backend documentation for the required `GATEWAY_CONTROL_ADDR` setting.
+
+Адресний push за авторизованою TMS-сесією використовує виданий бекендом
+`sessionId`: успішний `login`/`resume` реєструє його для транспортного з'єднання
+шлюзу. Внутрішні сервіси надсилають команду
+`{"action":"push_session","session_id":"<sessionId>","payload":"<JSON-RPC message>"}`
+до Control Plane. Шлюз доставляє payload, не аналізуючи бізнес-вміст JSON-RPC,
+і видаляє прив'язку після закриття транспортного з'єднання. Потрібне
+налаштування `GATEWAY_CONTROL_ADDR` описане в документації TMS backend-а.
 - JSON-RPC-2 is fetched directly from the upstream [`start` branch](https://github.com/vsvictor/JSON-RPC-2/tree/start), which provides reusable accepted-I/O, session, push and transport framing APIs. The workspace-owned `gateway-protocol` crate defines the private gateway/backend envelope and backend adapter. `Cargo.lock` pins the resolved commit; no local upstream checkout is required.
 
 For end-to-end build, environment configuration, backend compatibility, and deployment instructions, see the [ecosystem deployment guide](docs/tutorial.md).
