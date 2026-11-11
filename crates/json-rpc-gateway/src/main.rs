@@ -5,6 +5,7 @@ mod gateway;
 mod ingress;
 mod logging;
 mod session;
+mod startup;
 mod transport_policy;
 
 use std::{error::Error, fs::File, io::BufReader, net::SocketAddr};
@@ -43,7 +44,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| "/var/lib/json-rpc-gateway/backends.json".into()),
     )?;
-    pool.warm_up().await?;
+    startup::wait_for_backends(&pool, std::time::Duration::from_secs(60)).await?;
     let policy = transport_policy::TransportPolicy::load(
         config.transport_ports.keys().copied(),
         std::env::var_os("GATEWAY_TRANSPORT_STATE_PATH")

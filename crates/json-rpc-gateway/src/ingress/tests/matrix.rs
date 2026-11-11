@@ -114,6 +114,29 @@ fn client_endpoint(
     endpoint
 }
 
+#[tokio::test]
+async fn idle_quic_connection_survives_default_thirty_second_timeout() {
+    let (certificate, key) = identity();
+    let mut ingress = crate::ingress::GatewayIngress::new(make_server());
+    ingress
+        .set_bind([LOCALHOST])
+        .set_tls(vec![certificate.clone()], key)
+        .set_port(TransportKind::Quic, 0);
+    let running = ingress.start().await.unwrap();
+    let address = running.listeners().next().unwrap().1;
+    let endpoint = client_endpoint(LOCALHOST, &certificate, QUIC_ALPN);
+    let connection = endpoint
+        .connect(address, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(32)).await;
+    assert_eq!(connection.close_reason(), None);
+    connection.close(0u32.into(), b"test complete");
+    endpoint.close(0u32.into(), b"test complete");
+    running.close().await.unwrap();
+}
+
 fn boxed<T: RpcClientTransport>(
     connect: impl Future<Output = Result<T, TransportError>> + Send + 'static,
 ) -> DynTransportConnect {

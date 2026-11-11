@@ -52,7 +52,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-json-rpc-2-client = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
+json-rpc-2-client = { git = "https://github.com/vsvictor/JSON-RPC-2.git", rev = "af8d04dbbaee05fa1514caa07a37808d5973d100" }
 rcgen = "0.13"
 
 [target.'cfg(unix)'.dependencies]

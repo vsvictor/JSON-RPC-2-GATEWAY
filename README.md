@@ -33,6 +33,16 @@ See the TMS backend documentation for the required `GATEWAY_CONTROL_ADDR` settin
 
 For end-to-end build, environment configuration, backend compatibility, and deployment instructions, see the [ecosystem deployment guide](docs/tutorial.md).
 
+Gateway startup retries backend protocol health checks for up to 60 seconds
+before opening ingress listeners. Each failed attempt is logged; an unavailable
+or incompatible backend still fails startup explicitly. QUIC ingress sends
+transport keep-alives every 10 seconds, below its default 30-second idle timeout.
+
+Під час запуску gateway повторює перевірку протоколу бекендів до 60 секунд,
+перш ніж відкрити вхідні порти. Невдалі спроби журналюються; недоступний або
+несумісний бекенд усе одно завершує запуск явною помилкою. QUIC ingress надсилає
+транспортні keep-alive кожні 10 секунд, до стандартного idle timeout 30 секунд.
+
 To adopt new JSON-RPC-2 changes, run `cargo update -p json-rpc-2-runtime -p json-rpc-2-server`, then rebuild and test the workspace. Keep the updated `Cargo.lock` with the project so normal builds use the same library revision.
 
 ## Backend contract

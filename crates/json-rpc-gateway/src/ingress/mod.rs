@@ -670,7 +670,11 @@ impl GatewayIngress {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         tls.alpn_protocols = alpn;
         let crypto = QuicServerConfig::try_from(tls).map_err(io::Error::other)?;
-        Ok(quinn::ServerConfig::with_crypto(Arc::new(crypto)))
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        config.transport_config(Arc::new(transport));
+        Ok(config)
     }
 
     fn log_shared_close_error(result: &mut io::Result<()>, error: io::Error) {

@@ -10,18 +10,18 @@ default-members = ["crates/json-rpc-gateway"]
 resolver = "2"
 
 [workspace.dependencies]
-json-rpc-2-runtime = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start", default-features = false, features = ["tcp", "tls", "udp", "rtp", "rudp", "udplite", "dccp", "sctp", "quic", "http1", "http3", "mqtt", "coap", "amqp", "websocket", "websocket_tls"] }
+json-rpc-2-runtime = { git = "https://github.com/vsvictor/JSON-RPC-2.git", rev = "af8d04dbbaee05fa1514caa07a37808d5973d100", default-features = false, features = ["tcp", "tls", "udp", "rtp", "rudp", "udplite", "dccp", "sctp", "quic", "http1", "http3", "mqtt", "coap", "amqp", "websocket", "websocket_tls"] }
 gateway-protocol = { path = "crates/gateway-protocol" }
-json-rpc-2-core = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
-json-rpc-2-server = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
-json-rpc-2-transport = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
-json-rpc-2-tcp = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
-json-rpc-2-quic = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
-json-rpc-2-iot = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start" }
+json-rpc-2-core = { git = "https://github.com/vsvictor/JSON-RPC-2.git", rev = "af8d04dbbaee05fa1514caa07a37808d5973d100" }
+json-rpc-2-server = { git = "https://github.com/vsvictor/JSON-RPC-2.git", rev = "af8d04dbbaee05fa1514caa07a37808d5973d100" }
+json-rpc-2-transport = { git = "https://github.com/vsvictor/JSON-RPC-2.git", rev = "af8d04dbbaee05fa1514caa07a37808d5973d100" }
+json-rpc-2-tcp = { git = "https://github.com/vsvictor/JSON-RPC-2.git", rev = "af8d04dbbaee05fa1514caa07a37808d5973d100" }
+json-rpc-2-quic = { git = "https://github.com/vsvictor/JSON-RPC-2.git", rev = "af8d04dbbaee05fa1514caa07a37808d5973d100" }
+json-rpc-2-iot = { git = "https://github.com/vsvictor/JSON-RPC-2.git", rev = "af8d04dbbaee05fa1514caa07a37808d5973d100" }
 gateway-sessions = { path = "crates/gateway-sessions" }
 gateway-iot = { path = "crates/gateway-iot" }
-json-rpc-2-datagram = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start", default-features = false, features = ["udp", "rtp", "rudp", "udplite", "dccp", "sctp"] }
-json-rpc-2-websockets = { git = "https://github.com/vsvictor/JSON-RPC-2.git", branch = "start", default-features = false, features = ["websocket", "tls", "tcp", "udp", "rtp", "rudp", "udplite", "dccp", "sctp", "quic", "http1", "http3", "mqtt", "coap", "amqp"] }
+json-rpc-2-datagram = { git = "https://github.com/vsvictor/JSON-RPC-2.git", rev = "af8d04dbbaee05fa1514caa07a37808d5973d100", default-features = false, features = ["udp", "rtp", "rudp", "udplite", "dccp", "sctp"] }
+json-rpc-2-websockets = { git = "https://github.com/vsvictor/JSON-RPC-2.git", rev = "af8d04dbbaee05fa1514caa07a37808d5973d100", default-features = false, features = ["websocket", "tls", "tcp", "udp", "rtp", "rudp", "udplite", "dccp", "sctp", "quic", "http1", "http3", "mqtt", "coap", "amqp"] }
 
 [patch.crates-io]
 h3 = { git = "https://github.com/hyperium/h3", package = "h3" }
