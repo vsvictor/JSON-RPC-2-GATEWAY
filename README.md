@@ -1,12 +1,29 @@
 # JSON-RPC gateway workspace
 
-The `gateway-demo-backend` is a standalone base backend with `echo`, `identify`
-and built-in `rpc.list_methods`. It requires no application-specific features,
-external application configuration or database connections.
+`scripts/deploy-lan-ecosystem.sh` builds and installs the gateway with its
+in-process balancer and two application backend instances from
+`/home/dev/TMSBackend` (override with `TMS_BACKEND_ROOT`). It builds
+`main-tms-server` with the `tms,map` features; the backend's `.env` supplies
+application and database settings, while the service units set per-instance
+ports, TLS files and the gateway Control Plane address. The deployment also
+enables all supported LAN gateway protocol profiles. It requires reachable
+MongoDB/PostgreSQL services, active local Mosquitto/RabbitMQ services, and the
+configured TLS certificate and key. The target IP and ports are constants at
+the top of the script; the ingress port is `8443`. The standalone
+`gateway-demo-backend` remains available for development but is never installed
+by the deployment script.
 
-`scripts/deploy-lan-ecosystem.sh` installs the gateway (with its in-process
-balancer) and two base backends on one host. The target IP and ports are
-constants at the top of the script; the ingress port is `8443`.
+`scripts/deploy-lan-ecosystem.sh` збирає та встановлює gateway із вбудованим
+балансувальником і два екземпляри прикладного backend-а з
+`/home/dev/TMSBackend` (шлях можна змінити через `TMS_BACKEND_ROOT`). Збірка
+`main-tms-server` вмикає функції `tms,map`; `.env` backend-а задає прикладні
+налаштування та БД, а systemd units — порти кожного екземпляра, TLS-файли й
+адресу Control Plane шлюзу. Також вмикаються всі підтримувані LAN-профілі
+протоколів. Потрібні доступні MongoDB/PostgreSQL, активні локальні
+Mosquitto/RabbitMQ та налаштовані TLS сертифікат і ключ. IP і порти вузла
+задані на початку скрипту; ingress порт — `8443`. Окремий
+`gateway-demo-backend` лишається для розробки, але deployment його не збирає й
+не встановлює.
 
 This workspace separates ingress/session concerns from backend selection:
 
@@ -84,6 +101,7 @@ Required process environment (a `.env` file is also loaded):
 ```dotenv
 GATEWAY_BIND=0.0.0.0
 GATEWAY_PORT=8443
+GATEWAY_MAX_CONNECTIONS=65536
 CONTROL_PORT=8500
 BACKEND_CONFIG_PATH=./backends.json
 LOG_LEVEL=info
@@ -91,7 +109,15 @@ LOG_LEVEL=info
 
 `GATEWAY_DISPATCH_MAX_CONCURRENT` limits active backend forwards (default `256`); `GATEWAY_DISPATCH_QUEUE_CAPACITY` limits queued messages (default `1024`). Both must be positive integers. When the active limit and queue are full, the gateway rejects the new message without forwarding or replaying it; it does not synthesize a JSON-RPC error because business payloads are opaque. The caller receives no response and its transport/client timeout applies. A warning is logged for each admission rejection.
 
+`GATEWAY_MAX_CONNECTIONS` sets the gateway-wide maximum number of concurrent transport sessions (default `4096`) and must be a positive integer. The same value is applied to each transport runtime, while a shared gateway budget enforces the aggregate limit across transports. The gateway reads it from the process environment or the root `.env` file and overrides the upstream `ServerLimits::default()` value.
+
+`GATEWAY_MAX_CONNECTIONS` задає спільний для шлюзу максимум одночасних транспортних сесій (за замовчуванням `4096`); значення має бути додатним цілим числом. Воно застосовується до runtime кожного транспорту, а спільний лічильник шлюзу забезпечує сумарне обмеження між транспортами. Параметр зчитується зі змінних середовища або кореневого файлу `.env` і замінює значення upstream `ServerLimits::default()`.
+
 Prometheus metrics are served at `http://<METRICS_BIND>:<METRICS_PORT>/metrics` on a separate listener. Defaults are `METRICS_BIND=127.0.0.1` and `METRICS_PORT=9090`; the port must be nonzero. The exporter includes `gateway_backend_circuit_open` (0/1 per backend and transport), `gateway_backend_requests_rejected_total`, `gateway_dispatch_requests_rejected_total`, and `gateway_backend_circuit_probe_total` (success, failure, or cancellation). Metric labels are limited to configured backend IDs, transport names, and fixed outcome/reason values; connection IDs and request IDs are never labels.
+
+The `json-rpc-gateway` library exposes `inbound_traffic_bytes()` and `outbound_traffic_bytes()` to read cumulative JSON-RPC payload bytes since process start. These count message payloads (including successfully queued pushes), not transport framing, encryption, or network headers. Бібліотека `json-rpc-gateway` надає функції `inbound_traffic_bytes()` та `outbound_traffic_bytes()` для зчитування накопичених байтів JSON-RPC від моменту запуску процесу. Вони рахують корисне навантаження повідомлень (включно з успішно поставленими в чергу push-повідомленнями), але не враховують обрамлення транспорту, шифрування чи мережеві заголовки.
+
+Control Plane `list_components` includes these counters as `gateway.inbound_traffic_bytes` and `gateway.outbound_traffic_bytes`. They are sampled independently and are not an atomic snapshot. Control Plane `list_components` повертає ці лічильники в полях `gateway.inbound_traffic_bytes` і `gateway.outbound_traffic_bytes`. Значення зчитуються незалежно й не утворюють атомарний знімок.
 
 Logging policy: `ERROR` is for gateway-internal or startup failures, `WARN` for rejected requests, failed operations and recoverable backend/transport errors, `INFO` for listener/session lifecycle and circuit state transitions, `DEBUG` for complete inbound/outbound JSON-RPC, backend, push and Control Plane payloads with peer/endpoint and direction, and `TRACE` for high-frequency implementation details. DEBUG payloads are intentionally complete and can include credentials, tokens, personal data, or other secrets; enable DEBUG only with appropriate access controls, retention, and redaction at the log collection boundary. Payloads are not emitted at INFO or higher.
 

@@ -30,6 +30,8 @@ struct GatewayInfo {
     version: &'static str,
     pid: u32,
     uptime_seconds: u64,
+    inbound_traffic_bytes: u64,
+    outbound_traffic_bytes: u64,
     listeners: Vec<ListenerInfo>,
     control_address: SocketAddr,
     metrics_address: SocketAddr,
@@ -79,6 +81,8 @@ impl ComponentInventory {
                 version: env!("CARGO_PKG_VERSION"),
                 pid: std::process::id(),
                 uptime_seconds: self.started.elapsed().as_secs(),
+                inbound_traffic_bytes: json_rpc_gateway::inbound_traffic_bytes(),
+                outbound_traffic_bytes: json_rpc_gateway::outbound_traffic_bytes(),
                 listeners: self
                     .listeners
                     .iter()
@@ -99,3 +103,7 @@ impl ComponentInventory {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "components/tests.rs"]
+mod tests;

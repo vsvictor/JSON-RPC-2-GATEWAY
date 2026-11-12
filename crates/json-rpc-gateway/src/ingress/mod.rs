@@ -65,7 +65,7 @@ use json_rpc_2_websockets::server::transports::{
     JsonRpcWebSocket, WebSocketProtocol, WebSocketTransport,
 };
 
-use json_rpc_2_runtime::{MultiTransportServer, RunningServer, TransportKind};
+use json_rpc_2_runtime::{MultiTransportServer, RunningServer, ServerLimits, TransportKind};
 
 struct Identity {
     certificates: Vec<CertificateDer<'static>>,
@@ -76,6 +76,7 @@ pub struct GatewayIngress {
     protocol: Arc<dyn JsonRpcProtocol>,
     bind: Vec<IpAddr>,
     ports: std::collections::HashMap<TransportKind, u16>,
+    max_connections: usize,
     identity: Option<Identity>,
     udp_lite_config: UdpLiteConfig,
     #[cfg(feature = "srt")]
@@ -91,6 +92,7 @@ impl GatewayIngress {
             protocol,
             bind: Vec::new(),
             ports: Default::default(),
+            max_connections: ServerLimits::default().max_connections,
             identity: None,
             udp_lite_config: Default::default(),
             #[cfg(feature = "srt")]
@@ -122,6 +124,11 @@ impl GatewayIngress {
             }
             _ => {}
         }
+        self
+    }
+
+    pub fn set_max_connections(&mut self, max_connections: usize) -> &mut Self {
+        self.max_connections = max_connections;
         self
     }
 
@@ -207,7 +214,25 @@ impl GatewayIngress {
                 .validate()
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         }
-        let runtime = Arc::new(TransportRuntime::default());
+        if self.max_connections == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "gateway max connections must be greater than zero",
+            ));
+        }
+        if self.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "gateway max connections must not exceed {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ),
+            ));
+        }
+        let mut runtime = TransportRuntime::default();
+        runtime.limits.max_connections = self.max_connections;
+        let runtime = Arc::new(runtime);
+        self.standalone.set_server_limits(runtime.limits.clone());
         let mut groups: Vec<Vec<TransportKind>> = Vec::new();
         for kind in self.transports() {
             if kind.is_broker() {

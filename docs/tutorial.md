@@ -10,9 +10,11 @@ Balancer не є окремим процесом чи executable: окремо �
 
 ## Важливо про сумісність backend-а
 
-Для обробки трафіку від gateway backend має використовувати `json_rpc_2_server::RpcServer`, загорнутий у `gateway_protocol::GatewayBackendProtocol`. Це внутрішній протокол між gateway та backend-ом, який переносить оригінальний payload і метадані з'єднання. У цьому workspace немає окремого прикладного backend executable із бізнесовими методами: його потрібно надати/зібрати як застосунок, використовуючи наведений у README server adapter.
+Для обробки трафіку від gateway backend має використовувати `json_rpc_2_server::RpcServer`, загорнутий у `gateway_protocol::GatewayBackendProtocol`. Прикладний backend у `/home/dev/TMSBackend` уже реалізує контракт gateway v3 через `json-rpc-2-backend`; адаптер у цьому workspace додавати не потрібно. Deployment збирає `main-tms-server` з функціями `tms,map` і запускає два екземпляри з прикладними RPC-методами.
 
-Звичайний `JSON_RPC_2` CLI server — демонстраційний/прямий JSON-RPC сервер. Він **не** загортає протокол у `GatewayBackendProtocol` і тому не є сумісним gateway backend-ом без відповідного адаптера в прикладному сервері. Приклад адаптера і серверного запуску є в кореневому [README](../README.md#backend-contract).
+The application backend in `/home/dev/TMSBackend` already implements the gateway v3 backend contract through `json-rpc-2-backend`; no extra adapter is needed. Deployment builds `main-tms-server` with `tms,map` and starts two instances with the application RPC methods.
+
+Звичайний `JSON_RPC_2` CLI server — прямий JSON-RPC сервер, а не прикладний backend для цього deployment. Використовуйте його лише для окремої перевірки транспорту; сумісність production backend-а забезпечує `main-tms-server` із `/home/dev/TMSBackend`.
 
 Для окремої перевірки звичайного JSON-RPC-2 CLI server-а (не через gateway) можна запустити один transport:
 
@@ -76,7 +78,14 @@ cd /path/to/JSON-RPC-2
 cargo build --locked --release -p json-rpc-2-cli --bin JSON_RPC_2
 ```
 
-Якщо backend застосунок живе в окремому Cargo-проєкті, збирайте його окремо з зафіксованою версією JSON-RPC-2 та `gateway-protocol`. Для production зафіксуйте версію/commit у lockfile самого backend застосунку.
+Прикладний backend збирається окремо з власним lockfile:
+
+```sh
+cd /home/dev/TMSBackend
+cargo build --locked --release -p main-tms-server --features tms,map
+```
+
+`scripts/deploy-lan-ecosystem.sh` виконує цю збірку автоматично. Каталог джерел за замовчуванням — `/home/dev/TMSBackend`; за потреби задайте `TMS_BACKEND_ROOT`. Він також копіює `.env` backend-а у захищений каталог `/etc/json-rpc-ecosystem/tms-backend/`; systemd unit перевизначає bind-адреси, порти, TLS файли та `GATEWAY_CONTROL_ADDR`. Збірка `tms` потребує доступної MongoDB і PostgreSQL згідно з цим `.env`.
 
 ## Backend: реалізація та конфігурація
 
@@ -154,6 +163,7 @@ Backend-и спочатку проходять startup warm-up. Якщо буд�
 ```dotenv
 GATEWAY_BIND=10.20.0.5
 GATEWAY_PORT=8443
+GATEWAY_MAX_CONNECTIONS=4096
 CONTROL_PORT=8500
 BACKEND_CONFIG_PATH=/etc/json-rpc-gateway/backends.json
 LOG_LEVEL=info
@@ -459,9 +469,9 @@ IP і порти задаються константами на початку `
 `enable-lan-gateway-protocols-node.sh`.
 Потрібні Cargo на build-машині, systemd на цільовому вузлі, SSH-ключ для
 віддаленого встановлення та sudo-доступ. Для іншого SSH-акаунта задайте
-`SSH_USER`, для системного акаунта — `SERVICE_USER`.
-Для sudo налаштуйте `NOPASSWD` або передайте `SUDO_PASSWORD` із захищеного
-середовища; пароль не записується у файли чи аргументи.
+`SSH_USER`, для системного акаунта — `SERVICE_USER`. Deployment не читає пароль
+із environment, stdin чи файлів: `sudo` запитує його безпосередньо у видимому
+інтерактивному терміналі. Альтернативно можна налаштувати `NOPASSWD`.
 Створюються `json-rpc-gateway.service`, `json-rpc-backend-1.service`,
 `json-rpc-backend-2.service`, `gateway.env`, `backend-1.env`, `backend-2.env`
 та початковий `backends.json`.
@@ -478,8 +488,9 @@ IP і порти задаються константами на початку `
 
 ### LAN: усі доступні протоколи на одному порту
 
-Додатковий скрипт налаштовує gateway на `8443` для TCP/TLS/HTTP1, UDP/RTP/RUDP/SRT,
-QUIC/HTTP3/CoAP, SCTP/UDP-Lite та відповідних `ws-*` варіантів.
+`deploy-lan-ecosystem.sh` автоматично збирає gateway із SRT feature та після
+розгортання вмикає на `8443` TCP/TLS/HTTP1, UDP/RTP/RUDP/SRT, QUIC/HTTP3/CoAP,
+SCTP/UDP-Lite та відповідні `ws-*` варіанти.
 Це 24 socket profiles; DCCP та `ws-dccp` не ввімкнено, бо ядро вузла
 не підтримує DCCP. Сертифікат і ключ встановлено в
 `/etc/json-rpc-ecosystem/tls/` із правами `root:jsonrpc 0640`.
@@ -495,11 +506,16 @@ MQTT/AMQP та їхні `ws-*` варіанти працюють через ло
 SSH port forwarding або окремо погоджене захищене відкриття broker endpoints.
 Використовуються raw/WebSocket routes за замовчуванням, розділені topics/queues.
 Control Plane `list_components` показує 24 socket profiles, не 4 broker subscriptions.
-Усі 28 профілів включено через transport-specific змінні `gateway.env`.
-SRT passphrase генерується при першому ввімкненні й зберігається лише
-в захищеному `gateway.env`; передавайте її клієнтам захищеним каналом.
+Усі 28 профілів вмикаються через transport-specific змінні `gateway.env`.
+Перед запуском deployment перевіряє активність Mosquitto/RabbitMQ, наявність
+`/etc/ufw/before.rules` на вузлі та TLS файлів на build-машині. За замовчуванням
+це `/home/dev/Certs/server-fullchain.pem` і `/home/dev/Certs/server-key.pem`;
+за потреби їхні шляхи можна змінити через `GATEWAY_TLS_CERT_FILE` та
+`GATEWAY_TLS_KEY_FILE`. SRT passphrase генерується, якщо ще не задана, і
+зберігається лише в захищеному `gateway.env`; передавайте її клієнтам захищеним
+каналом.
 
-Для відтворення після встановлення `mosquitto` і `rabbitmq-server`:
+Для окремого повторного ввімкнення профілів після базового розгортання:
 
 ```sh
 ./scripts/build-with-srt.sh build --locked --release \
@@ -530,11 +546,29 @@ Node installer зберігає решту gateway env, налаштовує 28 
 ./scripts/stop-lan-ecosystem.sh
 ```
 
-Deployment встановлює базовий `gateway-demo-backend` без прикладних
-розширень і сховищ даних. Він надає `echo`, `identify` та вбудований
-`rpc.list_methods`. Node installer відмовляється замінювати backend із
-власними systemd drop-in `.conf`: спочатку явно перегляньте та приберіть
-їх, якщо хочете перейти саме на базовий deployment.
+Deployment збирає `main-tms-server` із `/home/dev/TMSBackend` з функціями
+`tms,map` та встановлює два його екземпляри замість demo backend-ів.
+Потрібні прикладний `.env`, доступні MongoDB і PostgreSQL та TLS сертифікат/ключ.
+`.env` встановлюється як root-owned файл із mode `0640`, доступний лише
+обліковому запису сервісу; його значення не виводяться в лог. Listener-и
+екземплярів використовують TCP/UDP `8081` і `8082`, TLS/QUIC `8083` і `8084`;
+Control Plane заданий як `192.168.1.132:8500`, а
+`JSON_RPC_HTTP_URL=http://192.168.1.132:8508` спрямовує logout та інші push-
+сповіщення у сервіс JSON-RPC-2-HTTP.
+
+The deployment builds `main-tms-server` from `/home/dev/TMSBackend` with
+`tms,map` and replaces the demo backend services. The application `.env`,
+reachable MongoDB and PostgreSQL, and a TLS certificate/key are required.
+The `.env` is installed as a root-owned mode-`0640` file readable by the
+service account; its values are not printed. Backend listeners use TCP/UDP
+ports `8081` and `8082`, TLS/QUIC ports `8083` and `8084`, and the gateway
+Control Plane address `192.168.1.132:8500`.
+`JSON_RPC_HTTP_URL=http://192.168.1.132:8508` routes logout and other push
+notifications to the JSON-RPC-2-HTTP service.
+
+Node installer відмовляється замінювати backend із власними systemd drop-in
+`.conf`; спочатку явно перегляньте та приберіть їх, якщо хочете керувати цими
+екземплярами через deployment.
 
 [`start-lan-ecosystem.sh`](../scripts/start-lan-ecosystem.sh) запускає два
 backend-и й gateway на одному цільовому вузлі та очікує ingress `8443`.
@@ -542,21 +576,22 @@ backend-и й gateway на одному цільовому вузлі та оч�
 перезапускає вже активні сервіси.
 [`stop-lan-ecosystem.sh`](../scripts/stop-lan-ecosystem.sh) зупиняє ці три
 сервіси на тому самому вузлі, зберігаючи автозапуск після reboot.
-Обидва скрипти використовують `SSH_USER=dev` та підтримують `SUDO_PASSWORD`;
-без нього потрібен `sudo -n`. Пароль не додавайте у скрипти чи репозиторій.
+Обидва скрипти використовують `SSH_USER=dev` і відкривають інтерактивний TTY
+для `sudo` на цільовому вузлі; пароль вводиться лише у видимому запиті
+термінала. Вони не читають пароль зі змінних середовища чи stdin.
 Якщо запуск завершиться помилкою, вже запущені сервіси залишаться працювати
 для діагностики.
 
-Базові backend-и не мають бізнесових методів: лише `echo`, `identify` та
-`rpc.list_methods`. `identify` повертає `backend-1` або `backend-2`, що
-дозволяє перевірити round-robin. Backend-и приймають TCP і UDP на однакових
-числових портах. Для production застосунку замініть demo binary і systemd
-launch configuration на backend із `GatewayBackendProtocol`.
+Backend-и реєструють TMS методи `login`, `resume`, `session.info`,
+`getShift`, `getOrders`, `startShift`, `finishShift`, `tracking.ingest`,
+`serverTime` та map-методи `map.load`/`map.click`, а також їхні `rpc.*`
+аліаси й `rpc.list_methods`. Gateway `list_methods` має показувати повний
+каталог; сам deployment не виконує операції входу чи запису в production БД.
 Основний deployment не змінює firewall. Для LAN доступу дозвольте TCP/UDP
 ingress `8443` із `192.168.1.0/24` (наприклад,
 `sudo ufw allow from 192.168.1.0/24 to any port 8443 proto tcp` та аналогічно
 `proto udp`); не відкривайте Control Plane `8500` публічно.
-Backend-порти `8081`/`8082` обмежте до gateway-вузла.
+Backend-порти `8081`–`8084` обмежте до gateway-вузла.
 Повторний `deploy-lan-ecosystem.sh` оновлює бінарники/початкові конфіги та
 перезапускає services; сумісний збережений реєстр і transport state залишає.
 

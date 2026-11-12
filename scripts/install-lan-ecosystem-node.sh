@@ -53,10 +53,39 @@ if ! id "$service_user" >/dev/null 2>&1; then
 fi
 
 install -d -o root -g root -m 0755 /opt/json-rpc-ecosystem/bin /etc/json-rpc-ecosystem
-for binary in gateway-demo-backend json-rpc-gateway; do
+install -d -o root -g jsonrpc -m 0750 \
+    /etc/json-rpc-ecosystem/tls /etc/json-rpc-ecosystem/tms-backend
+for binary in main-tms-server json-rpc-gateway; do
     install -o root -g root -m 0755 "$stage/$binary" "/opt/json-rpc-ecosystem/bin/$binary"
 done
+install -o root -g jsonrpc -m 0640 "$stage/tms-backend.env" \
+    /etc/json-rpc-ecosystem/tms-backend/.env
+install -o root -g jsonrpc -m 0640 "$stage/server-fullchain.pem" \
+    /etc/json-rpc-ecosystem/tls/server-fullchain.pem
+install -o root -g jsonrpc -m 0640 "$stage/server-key.pem" \
+    /etc/json-rpc-ecosystem/tls/server-key.pem
 install -o root -g root -m 0644 "$stage/backends.json" /etc/json-rpc-ecosystem/backends.json
+if [[ -f /etc/json-rpc-ecosystem/gateway.env ]]; then
+    python3 - /etc/json-rpc-ecosystem/gateway.env "$stage/gateway.env" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+current_path, staged_path = map(Path, sys.argv[1:])
+current = {}
+for line in current_path.read_text().splitlines():
+    key, separator, value = line.partition("=")
+    if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        current[key] = value
+staged = {}
+for line in staged_path.read_text().splitlines():
+    key, separator, value = line.partition("=")
+    if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        staged[key] = value
+current.update(staged)
+staged_path.write_text("".join(f"{key}={value}\n" for key, value in current.items()))
+PY
+fi
 install -o root -g root -m 0640 "$stage/gateway.env" /etc/json-rpc-ecosystem/gateway.env
 for id in 1 2; do
     install -o root -g root -m 0640 "$stage/backend-$id.env" "/etc/json-rpc-ecosystem/backend-$id.env"
@@ -88,4 +117,5 @@ for id in 1 2; do
 done
 systemctl restart json-rpc-gateway.service
 wait_for_tcp /etc/json-rpc-ecosystem/gateway.env GATEWAY_BIND GATEWAY_PORT
+rm -f /opt/json-rpc-ecosystem/bin/gateway-demo-backend
 systemctl --no-pager --full status json-rpc-gateway.service

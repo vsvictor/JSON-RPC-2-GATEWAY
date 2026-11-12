@@ -11,7 +11,12 @@ readonly control_port=8500
 }
 stage="$1"
 trap 'rm -rf -- "$stage"' EXIT
-systemctl is-active --quiet mosquitto rabbitmq-server
+systemctl is-active --quiet mosquitto
+systemctl is-active --quiet rabbitmq-server
+[[ -r /etc/ufw/before.rules ]] || {
+    echo "UFW before.rules is required to enable SCTP and UDP-Lite profiles" >&2
+    exit 1
+}
 python3 - "$gateway_port" <<'PY'
 from pathlib import Path
 import subprocess
@@ -77,22 +82,34 @@ systemctl restart json-rpc-gateway.service
 for ((attempt=0; attempt<60; attempt++)); do
     if python3 - "$gateway_host" "$control_port" <<'PY'
 import json, socket, sys
+
+def request(host, port, action):
+    with socket.create_connection((host, int(port)), timeout=1) as connection:
+        connection.sendall(json.dumps({"action": action}).encode() + b"\n")
+        return json.loads(connection.makefile("rb").readline())
+
 try:
-    with socket.create_connection((sys.argv[1],int(sys.argv[2])), timeout=1) as connection:
-        connection.sendall(b'{"action":"list_components"}\n')
-        response = json.loads(connection.makefile("rb").readline())
-        listeners = response["components"]["gateway"]["listeners"]
-        assert len(listeners) == 24, listeners
+    response = request(sys.argv[1], sys.argv[2], "list_components")
+    listeners = response["components"]["gateway"]["listeners"]
+    assert len(listeners) == 24, listeners
+    methods = request(sys.argv[1], sys.argv[2], "list_methods")
+    required = {
+        "login", "resume", "session.info", "getShift", "getOrders",
+        "startShift", "finishShift", "tracking.ingest", "serverTime",
+        "map.load", "map.click",
+    }
+    missing = required - set(methods["methods"])
+    assert methods["success"] and methods["complete"] and not missing, sorted(missing)
 except (OSError, ValueError, KeyError, AssertionError):
     raise SystemExit(1)
 PY
-    then
-        echo "Gateway ready: 28 protocols configured; DCCP unavailable in this kernel."
-        exit 0
+        then
+            echo "Gateway ready: 28 protocols configured and TMS application methods discovered; DCCP unavailable in this kernel."
+            exit 0
     fi
     sleep 1
 done
-echo "Gateway failed readiness; restoring previous binary and environment" >&2
+echo "Gateway/backend readiness failed; restoring previous gateway binary and environment" >&2
 cp -p "$stage/gateway.env.before" /etc/json-rpc-ecosystem/gateway.env
 install -o root -g root -m 0755 "$stage/gateway.before" /opt/json-rpc-ecosystem/bin/json-rpc-gateway.new
 mv -f /opt/json-rpc-ecosystem/bin/json-rpc-gateway.new /opt/json-rpc-ecosystem/bin/json-rpc-gateway

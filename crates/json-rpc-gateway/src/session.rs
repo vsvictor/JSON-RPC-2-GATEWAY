@@ -3,6 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use json_rpc_2_runtime::TransportContext;
+use json_rpc_gateway::record_outbound_traffic_bytes;
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -200,10 +201,12 @@ impl SessionRegistry {
             payload = %String::from_utf8_lossy(&payload),
             "sending gateway push"
         );
+        let payload_bytes = payload.len();
         if sender.send(payload).is_err() {
             self.remove_session(connection_id);
             return Err("ClientDisconnected".to_owned());
         }
+        record_outbound_traffic_bytes(payload_bytes);
         Ok(())
     }
 

@@ -51,13 +51,23 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| "/var/lib/json-rpc-gateway/transports.json".into()),
     )?;
-    let gateway = Gateway::with_policy(pool, config.dispatcher_limits, policy.clone())?;
+    let gateway = Gateway::with_policy_and_max_connections(
+        pool,
+        config.dispatcher_limits,
+        policy.clone(),
+        config.max_connections,
+    )?;
     let control_address = SocketAddr::new(config.bind, config.control_port);
     let control_listener = TcpListener::bind(control_address)
         .await
         .with_context(|| format!("binding Control Plane at {control_address}"))?;
     let mut server = GatewayIngress::new(gateway.multiplexed_protocol());
     server.set_bind([config.bind]);
+    server.set_max_connections(config.max_connections);
+    tracing::info!(
+        max_connections = config.max_connections,
+        "gateway-wide connection limit configured"
+    );
     #[cfg(any(target_os = "linux", target_os = "android"))]
     server.set_udplite_config(udplite_config);
     #[cfg(feature = "srt")]

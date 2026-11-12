@@ -2,7 +2,7 @@ use std::{collections::HashMap, env, fs, net::IpAddr, path::PathBuf};
 
 use anyhow::{Context, bail};
 use gateway_iot::GatewayIotConfig;
-use json_rpc_2_runtime::TransportKind;
+use json_rpc_2_runtime::{ServerLimits, TransportKind};
 use json_rpc_balancer::BackendConfig;
 use serde::Deserialize;
 
@@ -21,6 +21,7 @@ pub struct GatewayConfig {
     pub tls_key_path: Option<PathBuf>,
     pub iot: GatewayIotConfig,
     pub dispatcher_limits: DispatcherLimits,
+    pub max_connections: usize,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +122,10 @@ impl GatewayConfig {
         let iot = GatewayIotConfig::from_env(transport_ports.keys().any(|kind| kind.is_broker()))
             .context("loading gateway IoT configuration")?;
         let defaults = DispatcherLimits::default();
+        let max_connections = optional_positive_usize(
+            "GATEWAY_MAX_CONNECTIONS",
+            ServerLimits::default().max_connections,
+        )?;
         let dispatcher_limits = DispatcherLimits {
             queue_capacity: optional_positive_usize(
                 "GATEWAY_DISPATCH_QUEUE_CAPACITY",
@@ -145,6 +150,7 @@ impl GatewayConfig {
             tls_key_path: env::var_os("TLS_KEY_PATH").map(PathBuf::from),
             iot,
             dispatcher_limits,
+            max_connections,
         })
     }
 
@@ -237,35 +243,5 @@ fn parse_positive_usize(name: &str, value: &str) -> anyhow::Result<usize> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use json_rpc_2_runtime::TransportKind;
-
-    use super::{parse_positive_usize, validate_port_assignments};
-
-    #[test]
-    fn allows_tcp_adapters_on_the_same_port() {
-        let ports = HashMap::from([(TransportKind::Tcp, 8443), (TransportKind::Tls, 8443)]);
-        assert!(validate_port_assignments(&ports).is_ok());
-    }
-
-    #[test]
-    fn tcp_and_udp_can_share_the_same_numeric_port() {
-        let ports = HashMap::from([(TransportKind::Tcp, 8443), (TransportKind::Udp, 8443)]);
-        assert!(validate_port_assignments(&ports).is_ok());
-    }
-
-    #[test]
-    fn rejects_zero_external_broker_port() {
-        let ports = HashMap::from([(TransportKind::Mqtt, 0)]);
-        assert!(validate_port_assignments(&ports).is_err());
-    }
-
-    #[test]
-    fn dispatch_limits_must_be_positive_integers() {
-        assert_eq!(parse_positive_usize("LIMIT", "12").unwrap(), 12);
-        assert!(parse_positive_usize("LIMIT", "0").is_err());
-        assert!(parse_positive_usize("LIMIT", "invalid").is_err());
-    }
-}
+#[path = "config/tests.rs"]
+mod tests;

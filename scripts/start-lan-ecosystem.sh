@@ -7,16 +7,11 @@ readonly ssh_user="${SSH_USER:-dev}"
 
 run_node_sudo() {
     if hostname -I | tr ' ' '\n' | grep -Fxq "$gateway_host"; then
-        if [[ -n "${SUDO_PASSWORD:-}" ]]; then
-            printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
-        else
-            sudo -n "$@"
-        fi
-    elif [[ -n "${SUDO_PASSWORD:-}" ]]; then
-        printf '%s\n' "$SUDO_PASSWORD" |
-            ssh -o BatchMode=yes -o ConnectTimeout=10 "${ssh_user}@${gateway_host}" "sudo -S -p '' $*"
+        sudo "$@"
     else
-        ssh -o BatchMode=yes -o ConnectTimeout=10 "${ssh_user}@${gateway_host}" "sudo -n $*"
+        local remote_command
+        printf -v remote_command '%q ' sudo "$@"
+        ssh -tt -o ConnectTimeout=10 "${ssh_user}@${gateway_host}" "$remote_command"
     fi
 }
 

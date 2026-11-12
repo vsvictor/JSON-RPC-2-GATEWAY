@@ -6,13 +6,14 @@ use bytes::Bytes;
 use json_rpc_2_runtime::{TransportContext, TransportKind, TransportSession};
 use json_rpc_2_server::{JsonRpcProtocol, ProtocolFuture};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::JoinSet,
 };
 
 use crate::session::SessionRegistry;
 use crate::transport_policy::TransportPolicy;
 use json_rpc_balancer::BackendPool;
+use json_rpc_gateway::{record_inbound_traffic_bytes, record_outbound_traffic_bytes};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
@@ -72,6 +73,9 @@ pub struct Gateway {
     sessions: Arc<SessionRegistry>,
     policy: Arc<TransportPolicy>,
     session_generations: dashmap::DashMap<String, CancellationToken>,
+    session_lifecycle: std::sync::Mutex<()>,
+    connection_budget: Arc<Semaphore>,
+    session_permits: dashmap::DashMap<String, OwnedSemaphorePermit>,
 }
 
 pub struct GatewayProtocol {
@@ -163,19 +167,44 @@ impl Drop for TemporarySession {
 impl Gateway {
     #[cfg(test)]
     pub fn new(backends: BackendPool, limits: DispatcherLimits) -> anyhow::Result<Arc<Self>> {
-        Self::with_policy(
+        Self::with_policy_and_max_connections(
             backends,
             limits,
             TransportPolicy::new(TransportKind::ALL.iter().copied()),
+            json_rpc_2_runtime::ServerLimits::default().max_connections,
         )
     }
 
+    #[cfg(test)]
     pub fn with_policy(
         backends: BackendPool,
         limits: DispatcherLimits,
         policy: Arc<TransportPolicy>,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::with_policy_and_max_connections(
+            backends,
+            limits,
+            policy,
+            json_rpc_2_runtime::ServerLimits::default().max_connections,
+        )
+    }
+
+    pub fn with_policy_and_max_connections(
+        backends: BackendPool,
+        limits: DispatcherLimits,
+        policy: Arc<TransportPolicy>,
+        max_connections: usize,
+    ) -> anyhow::Result<Arc<Self>> {
         limits.validate()?;
+        if max_connections == 0 {
+            bail!("gateway max connections must be greater than zero");
+        }
+        if max_connections > Semaphore::MAX_PERMITS {
+            bail!(
+                "gateway max connections must not exceed {}",
+                Semaphore::MAX_PERMITS
+            );
+        }
 
         let (incoming, mut receiver) = mpsc::channel::<IncomingEnvelope>(limits.queue_capacity);
         let gateway = Arc::new(Self {
@@ -185,6 +214,9 @@ impl Gateway {
             sessions: SessionRegistry::new(),
             policy,
             session_generations: dashmap::DashMap::new(),
+            session_lifecycle: std::sync::Mutex::new(()),
+            connection_budget: Arc::new(Semaphore::new(max_connections)),
+            session_permits: dashmap::DashMap::new(),
         });
         let backends = Arc::clone(&gateway.backends);
         backends.start_maintenance();
@@ -223,6 +255,20 @@ impl Gateway {
             }
         });
         Ok(gateway)
+    }
+
+    fn try_temporary_connection_permit(
+        &self,
+        connection_id: &str,
+    ) -> Result<Option<OwnedSemaphorePermit>, ()> {
+        if self.session_generations.contains_key(connection_id) {
+            return Ok(None);
+        }
+        self.connection_budget
+            .clone()
+            .try_acquire_owned()
+            .map(Some)
+            .map_err(|_| ())
     }
 
     pub fn protocol(self: &Arc<Self>, source_transport: TransportKind) -> Arc<dyn JsonRpcProtocol> {
@@ -276,6 +322,7 @@ impl Gateway {
             tracing::debug!(transport = source_transport.id(), %connection_id, "disabled transport request rejected");
             return None;
         }
+        record_inbound_traffic_bytes(payload.len());
         let trace_id = self.next_trace_id.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
             trace_id,
@@ -330,6 +377,7 @@ impl Gateway {
         }
         match response.await {
             Ok(Ok(Some(MessageFrame::Raw(response)))) => {
+                record_outbound_traffic_bytes(response.len());
                 tracing::debug!(
                     trace_id,
                     connection_id = %log_connection_id,
@@ -342,6 +390,7 @@ impl Gateway {
                 Some(response)
             }
             Ok(Ok(Some(MessageFrame::WebSocketText(text)))) => {
+                record_outbound_traffic_bytes(text.len());
                 tracing::debug!(
                     trace_id,
                     connection_id = %log_connection_id,
@@ -354,6 +403,7 @@ impl Gateway {
                 Some(Bytes::from(text))
             }
             Ok(Ok(Some(MessageFrame::WebSocketBinary(bytes)))) => {
+                record_outbound_traffic_bytes(bytes.len());
                 tracing::debug!(
                     trace_id,
                     connection_id = %log_connection_id,
@@ -499,6 +549,17 @@ impl JsonRpcProtocol for GatewayProtocol {
             tracing::debug!(transport = transport.id(), %connection_id, "disabled or retired session request rejected");
             return Box::pin(async { None });
         }
+        let connection_permit = match gateway.try_temporary_connection_permit(&connection_id) {
+            Ok(permit) => permit,
+            Err(()) => {
+                tracing::warn!(
+                    transport = transport.id(),
+                    %connection_id,
+                    "gateway max connections reached; request rejected"
+                );
+                return Box::pin(async { None });
+            }
+        };
         let temporary = if context.push_sender.is_none()
             && gateway.sessions.register_temporary_session(context)
         {
@@ -510,6 +571,7 @@ impl JsonRpcProtocol for GatewayProtocol {
             None
         };
         Box::pin(async move {
+            let _connection_permit = connection_permit;
             let _session = temporary;
             gateway
                 .submit_admitted(transport, connection_id, input, admission)
@@ -532,12 +594,24 @@ impl JsonRpcProtocol for GatewayProtocol {
                 return None;
             }
             let context = TransportSession::stateless(transport.id());
+            let connection_permit =
+                match gateway.try_temporary_connection_permit(&context.connection_id) {
+                    Ok(permit) => permit,
+                    Err(()) => {
+                        tracing::warn!(
+                            transport = transport.id(),
+                            "gateway max connections reached; request rejected"
+                        );
+                        return None;
+                    }
+                };
             gateway.sessions.register_session(&context);
             let connection_id = context.connection_id.clone();
             let _session = TemporarySession {
                 sessions: Arc::clone(&gateway.sessions),
                 connection_id: connection_id.clone(),
             };
+            let _connection_permit = connection_permit;
             gateway
                 .submit_admitted(transport, connection_id, payload, admission)
                 .await
@@ -562,13 +636,44 @@ impl JsonRpcProtocol for GatewayProtocol {
     }
 
     fn session_opened(&self, context: &TransportContext) {
-        let token = self.gateway.policy.generation(self.source_transport.id());
-        self.gateway
+        let _lifecycle = self.gateway.session_lifecycle.lock().unwrap();
+        if self
+            .gateway
             .session_generations
-            .insert(context.connection_id.clone(), token.clone());
-        if token.is_cancelled() {
+            .contains_key(&context.connection_id)
+        {
             return;
         }
+        let token = self.gateway.policy.generation(self.source_transport.id());
+        if token.is_cancelled() {
+            self.gateway
+                .session_generations
+                .insert(context.connection_id.clone(), token);
+            return;
+        }
+        match self.gateway.connection_budget.clone().try_acquire_owned() {
+            Ok(permit) => {
+                self.gateway
+                    .session_permits
+                    .insert(context.connection_id.clone(), permit);
+            }
+            Err(_) => {
+                let rejected = CancellationToken::new();
+                rejected.cancel();
+                self.gateway
+                    .session_generations
+                    .insert(context.connection_id.clone(), rejected);
+                tracing::warn!(
+                    transport = self.source_transport.id(),
+                    connection_id = %context.connection_id,
+                    "gateway max connections reached; session rejected"
+                );
+                return;
+            }
+        }
+        self.gateway
+            .session_generations
+            .insert(context.connection_id.clone(), token);
         if let Err(error) = self
             .gateway
             .backends
@@ -586,9 +691,11 @@ impl JsonRpcProtocol for GatewayProtocol {
     }
 
     fn session_closed(&self, context: &TransportContext) {
+        let _lifecycle = self.gateway.session_lifecycle.lock().unwrap();
         self.gateway
             .session_generations
             .remove(&context.connection_id);
+        self.gateway.session_permits.remove(&context.connection_id);
         self.gateway.sessions.remove_session(&context.connection_id);
         self.gateway.backends.close_session(&context.connection_id);
     }

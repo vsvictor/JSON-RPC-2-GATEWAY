@@ -16,6 +16,45 @@ use tokio::{
 use super::{DispatcherLimits, Gateway};
 
 #[tokio::test]
+async fn max_connections_is_shared_across_gateway_transports_and_released_on_close() {
+    use crate::transport_policy::TransportPolicy;
+    use json_rpc_2_runtime::TransportSession;
+
+    let pool = BackendPool::new(vec![BackendConfig {
+        id: "backend".into(),
+        host: "127.0.0.1".into(),
+        ports: [("tcp".into(), 1)].into_iter().collect(),
+        pool_size: 1,
+        options: Default::default(),
+    }])
+    .unwrap();
+    let gateway = Gateway::with_policy_and_max_connections(
+        pool,
+        DispatcherLimits::default(),
+        TransportPolicy::new([TransportKind::Tcp, TransportKind::Quic]),
+        1,
+    )
+    .unwrap();
+    let tcp = gateway.protocol(TransportKind::Tcp);
+    let quic = gateway.protocol(TransportKind::Quic);
+    let first = TransportSession::new("tcp", true);
+    let rejected = TransportSession::new("quic", true);
+
+    tcp.session_opened(&first.context);
+    quic.session_opened(&rejected.context);
+    assert!(!tcp.session_close_requested(&first.context));
+    assert!(quic.session_close_requested(&rejected.context));
+
+    quic.session_closed(&rejected.context);
+    tcp.session_closed(&first.context);
+
+    let admitted = TransportSession::new("quic", true);
+    quic.session_opened(&admitted.context);
+    assert!(!quic.session_close_requested(&admitted.context));
+    quic.session_closed(&admitted.context);
+}
+
+#[tokio::test]
 async fn hot_backends_control_plane_updates_routing_discovery_and_closes_pinned_sessions() {
     use crate::transport_policy::tests::StateFile;
     use json_rpc_2_transport::WS_QUIC_ALPN;
